@@ -83,7 +83,7 @@ cd src-tauri; cargo test
 
 ## Publishing an update
 
-1. Bump the version in `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`.
+1. Bump the version in `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`, and write the version's section in `CHANGELOG.md` (it becomes the release notes).
 2. Push a tag `v<version>`. The GitHub Actions workflow builds the setup and the portable exe and attaches
    them, with the `.sha256`, to a release.
 3. Copies of FluxDM pick it up through *Check for updates* (the update source defaults to `MohammadFakih02/fluxdm`).

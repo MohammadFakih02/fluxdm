@@ -34,10 +34,25 @@ jobs:
         shell: pwsh
         run: ./build-setup.ps1
 
+      # The release notes are this version's section of CHANGELOG.md ("## 2.2.0 — date" up to the next "## ").
+      - name: Release notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          $out = @(); $on = $false
+          foreach ($l in Get-Content CHANGELOG.md) {
+            if ($l -match '^## ') { if ($on) { break }; $on = $l -match "^## $([regex]::Escape($v))\b"; continue }
+            if ($on) { $out += $l }
+          }
+          if (-not $out) { $out = @("See CHANGELOG.md.") }
+          $out += "", "**Download:** ``FluxDM-Setup-$v.exe`` (installer) or ``FluxDM.exe`` (portable). Not code-signed: if SmartScreen warns, click More info, then Run anyway."
+          Set-Content notes.md ($out -join "`n").Trim()
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          name: FluxDM ${{ github.ref_name }}
+          body_path: notes.md
           files: |
             dist/FluxDM-Setup-*.exe
             dist/FluxDM.exe
