@@ -1,0 +1,16 @@
+name: Feature request
+description: Something FluxDM should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What would you like?
+      description: What should it do, and what would you use it for?
+    validations:
+      required: true
+  - type: textarea
+    id: now
+    attributes:
+      label: How do you do it today?
+      description: Another app, a workaround, or not at all.

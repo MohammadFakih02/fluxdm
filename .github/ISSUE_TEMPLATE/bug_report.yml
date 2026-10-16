@@ -1,0 +1,29 @@
+name: Bug report
+description: Something in FluxDM doesn't work
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: FluxDM version
+      description: Settings → Updates, or the setup's file name
+      placeholder: "2.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind of download
+      options: [Normal file (web link), Video (yt-dlp), Torrent / magnet, Browser extension, Other]
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Windows version, screenshots, and the end of %APPDATA%\FluxDM\error.log if there is one. Remove private links before posting.

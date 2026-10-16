@@ -105,11 +105,13 @@ runtime), [Tauri](https://tauri.app) (MIT/Apache-2.0).
 
 ## Contributing
 
-Every commit that changes code must also update `PROJECT_STATE.md` and `CHANGELOG.md`. Run
-`git config core.hooksPath .githooks` once after cloning to turn on the check.
+Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Every commit that changes code must
+also update `PROJECT_STATE.md` and `CHANGELOG.md`; run `git config core.hooksPath .githooks` once after cloning
+to turn on the check.
 
 ## License
 
 [MIT](LICENSE) © 2026 Mohammad Fakih. The patched librqbit crates in `src-tauri/vendor/` are Apache-2.0
-([LICENSE-APACHE](src-tauri/vendor/LICENSE-APACHE)); see `src-tauri/vendor/PATCHES.md` for what was changed.
+([LICENSE-APACHE](src-tauri/vendor/LICENSE-APACHE)); see `src-tauri/vendor/PATCHES.md` for what was changed and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for everything else FluxDM uses.
 
