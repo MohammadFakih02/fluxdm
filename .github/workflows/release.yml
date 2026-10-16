@@ -1,0 +1,44 @@
+# Push a tag like v2.0.1 → builds on Windows and publishes a GitHub release with
+# FluxDM-Setup-<version>.exe, FluxDM.exe and FluxDM.exe.sha256 (what FluxDM's
+# "Check for updates" downloads and verifies). Keep the tag equal to the version in
+# src-tauri/tauri.conf.json and src-tauri/Cargo.toml.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Test
+        working-directory: src-tauri
+        run: cargo test --release
+
+      - name: Build
+        shell: pwsh
+        run: ./build-setup.ps1
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/FluxDM-Setup-*.exe
+            dist/FluxDM.exe
+            dist/FluxDM.exe.sha256

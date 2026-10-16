@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "FluxDM Integration",
+  "version": "1.4.0",
+  "description": "Hands browser downloads and download links to the FluxDM download manager.",
+  "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "96": "icons/96.png", "128": "icons/128.png" },
+  "action": {
+    "default_title": "FluxDM",
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/16.png", "32": "icons/32.png" }
+  },
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"],
+    "type": "module"
+  },
+  "permissions": ["downloads", "contextMenus", "storage", "cookies", "scripting", "activeTab", "notifications", "webRequest", "webRequestBlocking"],
+  "host_permissions": ["<all_urls>"],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "fluxdm@fluxdm.local",
+      "strict_min_version": "115.0",
+      "data_collection_permissions": { "required": ["none"] }
+    }
+  }
+}

@@ -1,0 +1,57 @@
+body { background: var(--panel); }
+#add { display: flex; flex-direction: column; height: 100vh; }
+#add .scroll { flex: 1; overflow: auto; padding: 16px 20px 10px; display: flex; flex-direction: column; gap: 12px; }
+#add .scroll > * { flex: none; }
+
+/* the link: one line, expandable */
+.linkbar { display: flex; align-items: flex-start; gap: 4px; }
+/* collapsed: one 30px line and no vertical padding, so the next line can't peek in */
+#urls { flex: 1; min-width: 0; height: 32px; min-height: 32px; max-height: 160px; resize: none; overflow: hidden; white-space: pre; line-height: 30px; padding-top: 0; padding-bottom: 0; }
+#add.expanded #urls { white-space: pre-wrap; overflow-y: auto; overflow-wrap: anywhere; line-height: 18px; padding-top: 6px; padding-bottom: 6px; }
+.iconbtn { width: 32px; height: 32px; padding: 0; color: var(--text-2); flex: none; }
+.iconbtn svg { width: 15px; height: 15px; transition: transform .15s; }
+#add.expanded #expand svg { transform: rotate(180deg); }
+#copyLink.done { color: var(--ok, var(--accent)); }
+#openTorrent { height: 32px; margin-left: 4px; }
+.count { align-self: center; font-size: 11.5px; color: var(--text-2); background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 1px 8px; white-space: nowrap; }
+#linkHint { margin-top: -6px; }
+
+#info { white-space: pre-line; line-height: 1.55; background: var(--panel-2); padding: 10px 14px; }
+#info .warn { color: var(--warn); }
+
+/* torrent files: the main part of the window */
+#add.torrent .scroll > #torrentPanel { flex: 1 1 0; min-height: 190px; display: flex; flex-direction: column; }
+.thead-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+#tFilter { width: 170px; min-height: 24px; height: 24px; padding: 2px 8px; font-size: 12px; }
+#tree { flex: 1; min-height: 0; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--input); }
+.tcols { display: flex; padding: 4px 12px 4px 71px; font-size: 11.5px; color: var(--text-3); border-bottom: 1px solid var(--line); background: var(--panel-2); }
+.tsize { width: 86px; text-align: right; flex: none; }
+#torrentFiles { flex: 1; overflow: auto; }
+.trow { display: flex; align-items: center; gap: 6px; height: 26px; padding-right: 12px; }
+.trow:hover { background: var(--hover); }
+.trow .tw { width: 16px; height: 16px; flex: none; display: flex; align-items: center; justify-content: center; color: var(--text-3); }
+.trow .tw svg { width: 12px; height: 12px; transition: transform .12s; }
+.trow.closed .tw svg { transform: rotate(-90deg); }
+.trow input { accent-color: var(--accent); margin: 0; width: 14px; height: 14px; flex: none; }
+.trow .ti { display: flex; flex: none; color: var(--text-3); }
+.trow .ti svg { width: 15px; height: 15px; }
+.trow .tn { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trow.dir .tn { font-weight: 600; }
+.trow.off .tn { color: var(--text-3); }
+.trow .tsize { color: var(--text-3); font-size: 12px; }
+.tempty { padding: 14px; color: var(--text-3); }
+
+.grid { display: grid; grid-template-columns: 110px 1fr; gap: 8px 12px; align-items: center; }
+.grid input[type=text] { width: 100%; }
+.grid .speedbox input[type=text] { width: auto; }
+.grid input:disabled, .grid select:disabled { opacity: .5; }
+.grid label.check { padding: 0; align-items: center; }
+.grid label.check input { margin: 0; }
+#add.torrent [data-notorrent], #add.torrent #advanced, #add.torrent #videoBlock { display: none; }
+#advanced summary { cursor: default; color: var(--text-2); padding: 4px 0; }
+#advanced summary:hover { color: var(--text); }
+#advanced textarea { width: 100%; }
+#add footer { display: flex; gap: 8px; justify-content: flex-end; padding: 12px 20px 16px; border-top: 1px solid var(--line); background: var(--panel); }
+#add footer button { min-width: 100px; }
+#start { min-width: 150px; }
+code { font-family: var(--mono); font-size: 11.5px; background: var(--panel-2); padding: 1px 4px; border-radius: 3px; }

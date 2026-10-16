@@ -1,0 +1,23 @@
+#!/bin/sh
+# FluxDM rule: every commit that changes code also updates the docs (PROJECT_STATE.md + CHANGELOG.md).
+# Enable once per clone:  git config core.hooksPath .githooks
+staged=$(git diff --cached --name-only --diff-filter=ACMRD)
+[ -z "$staged" ] && exit 0
+code=$(printf '%s\n' "$staged" | grep -E '^(src-tauri/|ui/|[^/]+\.ps1$)' )
+[ -z "$code" ] && exit 0
+missing=""
+printf '%s\n' "$staged" | grep -qx 'PROJECT_STATE.md' || missing="$missing PROJECT_STATE.md"
+printf '%s\n' "$staged" | grep -qx 'CHANGELOG.md' || missing="$missing CHANGELOG.md"
+if [ -n "$missing" ]; then
+  echo "pre-commit: this commit changes code but doesn't update:$missing" >&2
+  echo "  Rule (CLAUDE.md, README.md): update the docs before every commit." >&2
+  echo "  Add a dated entry to PROJECT_STATE.md and the user-visible changes to CHANGELOG.md," >&2
+  echo "  update README.md / GUIDE.md if facts changed, stage them, and commit again." >&2
+  exit 1
+fi
+# no personal data in the public repo
+if git diff --cached -U0 -- . ':!.githooks' | grep -E '^\+' | grep -qiE 'C:[\/]Users[\/]moudi|D:[\/]BuildCache'; then
+  echo "pre-commit: a staged change contains a local path. Keep those out of the public repo." >&2
+  exit 1
+fi
+exit 0

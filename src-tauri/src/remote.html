@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16181d">
+<title>FluxDM Remote</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--text:#1c1f24;--muted:#6b7280;--line:#e3e5e9;--accent:#4f46e5;--ok:#16a34a;--bad:#dc2626;--bar:#e5e7eb;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--bg:#16181d;--card:#22252c;--text:#e8eaee;--muted:#9aa0aa;--line:#30343c;--accent:#7c74ff;--bar:#353a44}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;padding:0 14px calc(24px + env(safe-area-inset-bottom))}
+header{position:sticky;top:0;background:var(--bg);padding:14px 0 10px;z-index:2}
+h1{font-size:18px;margin:0;display:flex;align-items:center;gap:8px}
+h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:auto}
+.speed{font-size:30px;font-weight:650;margin:6px 0 2px;font-variant-numeric:tabular-nums}
+.sub{color:var(--muted);font-size:13px}
+.row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+button,select,input{font:inherit;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--text);padding:10px 12px;min-height:44px}
+button{cursor:pointer}
+button.primary{background:var(--accent);color:#fff;border-color:transparent}
+button.danger{color:var(--bad)}
+.grow{flex:1;min-width:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px;margin-top:10px}
+.name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.meta{color:var(--muted);font-size:13px;margin-top:2px;display:flex;justify-content:space-between;gap:8px}
+.bar{height:6px;background:var(--bar);border-radius:99px;margin:8px 0;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent);border-radius:99px;transition:width .4s}
+.card.done .bar i{background:var(--ok)}
+.card.err .meta span:first-child{color:var(--bad)}
+.acts{display:flex;gap:8px;margin-top:8px}
+.acts button,.acts select{flex:1;min-height:40px;padding:6px;min-width:0}
+.check{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:14px}
+.check input{min-height:auto;width:20px;height:20px}
+#login{display:none;max-width:340px;margin:18vh auto 0;text-align:center}
+#login input{width:100%;text-align:center;font-size:24px;letter-spacing:6px;margin:14px 0}
+#msg{color:var(--bad);min-height:1.4em}
+.empty{color:var(--muted);text-align:center;margin:40px 0}
+details summary{color:var(--muted);cursor:pointer;margin-top:12px}
+</style>
+</head>
+<body>
+<div id="login">
+  <h1 style="justify-content:center">FluxDM</h1>
+  <p class="sub">Enter the PIN shown in FluxDM → Settings → Phone remote.</p>
+  <input id="pin" inputmode="numeric" autocomplete="one-time-code" maxlength="12" placeholder="PIN">
+  <button class="primary" id="go" style="width:100%">Connect</button>
+  <p id="msg"></p>
+</div>
+
+<div id="app" style="display:none">
+<header>
+  <h1>FluxDM <small id="count"></small></h1>
+  <div class="speed" id="speed">—</div>
+  <div class="sub" id="limitInfo"></div>
+  <div class="row">
+    <button class="grow" id="pauseAll">Pause all</button>
+    <button class="grow" id="resumeAll">Resume all</button>
+    <select class="grow" id="limit" aria-label="Global speed limit"></select>
+  </div>
+</header>
+
+<div class="card">
+  <div class="row" style="margin:0">
+    <input class="grow" id="url" type="url" placeholder="Paste a link to download" autocomplete="off">
+    <button class="primary" id="add">Add</button>
+  </div>
+  <label class="check" style="margin-top:10px"><input type="checkbox" id="video"> It's a video/music page (YouTube etc.)</label>
+</div>
+
+<div id="list"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const LIMITS = [["Unlimited",0],["256 KB/s",256],["512 KB/s",512],["1 MB/s",1024],["2 MB/s",2048],["5 MB/s",5120],["10 MB/s",10240],["Custom…",-1]];
+let pin = localStorage.getItem("fluxdm-pin") || "";
+const fromLink = new URLSearchParams(location.hash.slice(1)).get("pin");
+if (fromLink) { pin = fromLink; localStorage.setItem("fluxdm-pin", pin); history.replaceState(null, "", location.pathname); }
+let timer = null, lastLimit = null, busyUntil = 0; // busyUntil: pause redraws while a picker is open
+
+async function api(path, body) {
+  const r = await fetch("/api/" + path, {
+    method: body ? "POST" : "GET",
+    headers: { "X-Pin": pin, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (r.status === 401) { showLogin("Wrong PIN"); throw new Error("pin"); }
+  if (r.status === 429) { showLogin("Too many wrong PINs — try again in 5 minutes"); throw new Error("locked"); }
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+function showLogin(msg) {
+  clearInterval(timer); timer = null;
+  $("#app").style.display = "none"; $("#login").style.display = "block";
+  $("#msg").textContent = msg || "";
+}
+
+function showApp() {
+  $("#login").style.display = "none"; $("#app").style.display = "block";
+  refresh();
+  if (!timer) timer = setInterval(() => { if (!document.hidden) refresh(); }, 1500);
+}
+
+$("#go").onclick = () => { pin = $("#pin").value.trim(); localStorage.setItem("fluxdm-pin", pin); showApp(); };
+$("#pin").addEventListener("keydown", e => { if (e.key === "Enter") $("#go").click(); });
+
+function limitLabel(kbps) {
+  return kbps >= 1024 ? (kbps / 1024).toFixed(2).replace(/\.?0+$/, "") + " MB/s" : kbps + " KB/s";
+}
+/** Fills a speed picker; unknown values get their own entry. zeroLabel: "Unlimited" (global) or "No limit" (one download). */
+function fillLimits(sel, kbps, zeroLabel) {
+  sel.replaceChildren();
+  for (const [label, v] of LIMITS) {
+    const o = document.createElement("option"); o.value = v; o.textContent = v === 0 ? zeroLabel : label; sel.append(o);
+  }
+  if (!LIMITS.some(([, v]) => v === kbps)) {
+    const o = document.createElement("option"); o.value = kbps; o.textContent = limitLabel(kbps);
+    sel.insertBefore(o, sel.lastElementChild);
+  }
+  sel.value = kbps;
+  sel.addEventListener("focus", () => busyUntil = Date.now() + 15000);
+  sel.addEventListener("pointerdown", () => busyUntil = Date.now() + 15000);
+  sel.addEventListener("blur", () => busyUntil = 0);
+}
+/** Reads the chosen limit (asking for a number on "Custom…"); null if cancelled. */
+function pickedLimit(sel, current, what) {
+  let v = +sel.value;
+  if (v === -1) {
+    const t = prompt("Speed limit for " + what + " in KB/s (1024 = 1 MB/s, 0 = no limit)", current || 1024);
+    if (t === null) return null;
+    v = Math.max(0, parseInt(t, 10) || 0);
+  }
+  return v;
+}
+fillLimits($("#limit"), 0, "Unlimited");
+$("#limit").onchange = async () => {
+  const v = pickedLimit($("#limit"), lastLimit, "everything");
+  busyUntil = 0; $("#limit").blur();
+  if (v === null) { setLimitSelect(lastLimit); return; }
+  await api("limit", { kbps: v }); refresh();
+};
+function setLimitSelect(kbps) {
+  const sel = $("#limit");
+  if (+sel.value === kbps && [...sel.options].some(o => +o.value === kbps)) return;
+  fillLimits(sel, kbps, "Unlimited");
+}
+
+$("#pauseAll").onclick = () => api("all", { action: "pause" }).then(refresh);
+$("#resumeAll").onclick = () => api("all", { action: "resume" }).then(refresh);
+$("#add").onclick = async () => {
+  const url = $("#url").value.trim();
+  if (!/^https?:\/\//i.test(url)) { alert("Paste an http(s) link"); return; }
+  await api("add", { url, video: $("#video").checked });
+  $("#url").value = ""; refresh();
+};
+
+function card(it) {
+  const c = document.createElement("div");
+  c.className = "card" + (it.status === "Completed" ? " done" : it.status === "Error" ? " err" : "");
+  const name = document.createElement("div"); name.className = "name"; name.textContent = it.name;
+  const bar = document.createElement("div"); bar.className = "bar";
+  const fill = document.createElement("i"); fill.style.width = Math.max(0, Math.min(100, it.progress)) + "%"; bar.append(fill);
+  const meta = document.createElement("div"); meta.className = "meta";
+  const left = document.createElement("span"); left.textContent = it.statusText;
+  const right = document.createElement("span");
+  right.textContent = [it.progressText, it.speedText, it.eta, it.limitText ? "≤ " + it.limitText : ""].filter(Boolean).join(" · ") || it.sizeText;
+  meta.append(left, right);
+  const acts = document.createElement("div"); acts.className = "acts";
+  const running = ["Connecting", "Downloading", "Verifying"].includes(it.status);
+  if (it.status !== "Completed") {
+    const b = document.createElement("button");
+    b.textContent = running ? "Pause" : "Resume";
+    b.onclick = () => api("item", { id: it.id, action: running ? "pause" : "resume" }).then(refresh);
+    acts.append(b);
+    const lim = document.createElement("select");
+    lim.setAttribute("aria-label", "Speed limit for this download");
+    fillLimits(lim, it.limitKBps, "No limit");
+    lim.onchange = async () => {
+      const v = pickedLimit(lim, it.limitKBps, "“" + it.name + "”");
+      busyUntil = 0; lim.blur();
+      if (v === null) { refresh(); return; }
+      await api("item", { id: it.id, action: "limit", kbps: v }); refresh();
+    };
+    acts.append(lim);
+  }
+  const del = document.createElement("button"); del.className = "danger"; del.textContent = "Remove";
+  del.onclick = () => { if (confirm("Remove “" + it.name + "” from the list? (Downloaded files are kept.)")) api("item", { id: it.id, action: "remove" }).then(refresh); };
+  acts.append(del);
+  c.append(name, bar, meta, acts);
+  return c;
+}
+
+async function refresh() {
+  if (Date.now() < busyUntil) return; // a picker is open — redrawing would close it
+  let s;
+  try { s = await api("state"); } catch (e) { if (e.message !== "pin" && e.message !== "locked") $("#speed").textContent = "Offline"; return; }
+  $("#speed").textContent = s.speedText || "Idle";
+  $("#count").textContent = s.running + " running";
+  $("#limitInfo").textContent = "Limit: " + s.limitText + (s.schedule ? " (speed schedule active)" : "");
+  lastLimit = s.limitKBps; setLimitSelect(s.limitKBps);
+  const list = $("#list"); list.replaceChildren();
+  if (!s.items.length) { const p = document.createElement("p"); p.className = "empty"; p.textContent = "No downloads yet."; list.append(p); }
+  for (const it of s.items) list.append(card(it));
+}
+
+if (pin) showApp(); else showLogin();
+</script>
+</body>
+</html>

@@ -1,0 +1,55 @@
+FluxDM - how to install
+=======================
+
+FluxDM is a download manager for Windows 10/11: fast multi-connection downloads that survive restarts,
+videos from YouTube and 1000+ sites, and a built-in torrent client.
+
+
+1. INSTALL
+----------
+Run FluxDM-Setup.exe (the file name includes the version number).
+
+Windows will probably say "Windows protected your PC". That's because the app isn't signed with a paid
+certificate, not because something is wrong. Click "More info", then "Run anyway".
+
+The setup installs for your Windows account only (no admin password needed) and adds FluxDM to the
+Start Menu. It also opens .torrent files with FluxDM.
+
+
+2. FIRST START
+--------------
+- The first time you download a torrent, FluxDM asks to be allowed through the Windows firewall.
+  Say yes: without it, torrents find far fewer peers and download slowly.
+- The first time you download a video, FluxDM fetches two free helper tools (yt-dlp and ffmpeg) by
+  itself. That takes a minute once.
+
+
+3. BROWSER EXTENSION (catches downloads from your browser)
+----------------------------------------------------------
+In FluxDM, click Settings (top bar), then "Browser extension" on the left. You'll see a button for
+each browser on your PC.
+
+Firefox (also Waterfox, LibreWolf, Floorp, Zen):
+  Click "Add to Mozilla Firefox" (or your browser), then "Add" in its prompt. Done.
+
+Chrome, Edge, Brave, Opera, Vivaldi:
+  Click "Add to Google Chrome" (or your browser). Its extensions page opens together with a folder.
+    1. Turn on "Developer mode" (a switch at the top right of that page; in Edge it's on the left).
+    2. Click "Load unpacked".
+    3. Pick the "BrowserExtension" folder that just opened.
+  Leave that folder where it is; the browser loads the extension from it. If Chrome ever warns about
+  "developer mode extensions", close the warning with the X. Don't click "Disable".
+
+Check that it works: click the FluxDM icon in the browser's toolbar. It should say "connected" while
+FluxDM is running. (If you don't see the icon, look under the puzzle-piece button and pin it.)
+
+When FluxDM isn't running, your browser downloads things normally.
+
+
+4. GOOD TO KNOW
+---------------
+- Copying a download link opens FluxDM's Add window automatically. You can turn that off in Settings.
+- Closing the window keeps FluxDM in the tray (next to the clock). To quit, right-click the tray icon > Exit.
+- To update: run a newer setup over the old one. Your downloads and settings are kept.
+- To uninstall: Windows Settings > Apps > Installed apps > FluxDM > Uninstall.
+  Your download list stays in %APPDATA%\FluxDM in case you reinstall; delete that folder to remove it.

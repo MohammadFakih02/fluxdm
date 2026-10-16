@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check UI scripts
+        shell: bash
+        run: for f in ui/*.js src-tauri/extension/*.js; do node --check "$f" || exit 1; done
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test --release --locked

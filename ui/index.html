@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FluxDM</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="main.css">
+</head>
+<body>
+<div id="app">
+  <header id="toolbar">
+    <div class="tb-group">
+      <button id="btnAdd" class="primary" title="Add one or many links (Ctrl+N)"><span data-icon="add"></span>Add URL</button>
+      <button id="btnResume" class="ghost" title="Start / resume selected (Space)"><span data-icon="play"></span>Resume</button>
+      <button id="btnPause" class="ghost" title="Pause selected (Space)"><span data-icon="pause"></span>Pause</button>
+      <button id="btnPauseAll" class="ghost" title="Pause everything and stop all queues"><span data-icon="pauseAll"></span>Pause all</button>
+      <button id="btnDelete" class="ghost" title="Remove selected (Del)"><span data-icon="trash"></span>Delete</button>
+      <button id="btnClear" class="ghost" title="Remove all finished downloads from the list (files are kept)"><span data-icon="broom"></span>Clear finished</button>
+      <span class="tb-sep"></span>
+      <button id="btnScheduler" class="ghost tb-2" title="Queues and scheduler"><span data-icon="clock"></span>Scheduler</button>
+      <button id="btnStats" class="ghost tb-2" title="How much you downloaded per day and month"><span data-icon="chart"></span>Stats</button>
+      <button id="btnColumns" class="ghost tb-2" title="Choose which columns the list shows"><span data-icon="columns"></span>Columns</button>
+      <button id="btnSettings" class="ghost tb-2" title="Settings"><span data-icon="gear"></span>Settings</button>
+    </div>
+    <div id="updateBadge" hidden><button id="btnUpdate" class="small primary">Update available</button></div>
+    <label id="search" title="Filter by name or URL (Ctrl+F)">
+      <span data-icon="search"></span>
+      <input id="searchBox" type="text" placeholder="Search" spellcheck="false">
+    </label>
+  </header>
+
+  <div id="main">
+    <nav id="sidebar">
+      <div id="nav"></div>
+      <div id="queuePanel" class="card" hidden>
+        <div id="queueInfo"></div>
+        <div class="row" style="margin-top:10px">
+          <button id="queueStart" class="grow">Start queue</button>
+          <button id="queueStop" class="grow">Stop</button>
+        </div>
+      </div>
+    </nav>
+    <div class="split-v" id="splitSidebar"></div>
+
+    <section id="content">
+      <div id="listWrap">
+        <table id="list">
+          <thead><tr id="head"></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div id="emptyList" hidden>
+          <div class="empty-icon" data-icon="down"></div>
+          <div class="empty-title">No downloads here yet</div>
+          <div class="hint">Click <b>Add URL</b>, paste a link with Ctrl+V, drop links or a .torrent here — or just copy a download link anywhere.</div>
+        </div>
+      </div>
+      <div class="split-h" id="splitDetails"></div>
+      <div id="details">
+        <div id="detailsEmpty">Select a download to see its connections, speed graph and options.<br>Tip: drag links or a .txt of links onto this window, or copy a link — FluxDM catches it.</div>
+        <div id="detailsPane" hidden>
+          <div id="tabs">
+            <button class="tab active" data-tab="general">General</button>
+            <button class="tab" data-tab="trackers" data-torrent>Trackers</button>
+            <button class="tab" data-tab="peers" data-torrent>Peers</button>
+            <button class="tab" data-tab="content" data-torrent>Content</button>
+          </div>
+          <div class="tabpage" id="tab-general">
+            <div id="genLeft">
+              <div class="gen-head">
+                <img id="dCover" alt="" hidden>
+                <div class="grow">
+                  <div id="dName" class="ell selectable"></div>
+                  <input id="dUrl" type="text" readonly spellcheck="false">
+                </div>
+              </div>
+              <div class="kv">
+                <span>Saved to</span><span id="dPath" class="selectable"></span>
+                <span>Progress</span><span id="dProgress"></span>
+                <span>Resumable</span><span id="dResumable"></span>
+                <span>Status</span><span id="dStatus" class="selectable"></span>
+                <span data-http>Connections</span>
+                <span data-http class="row"><input id="dConn" type="range" min="1" max="64" class="grow" title="Changes apply live — more connections split the remaining work"><b id="dConnVal"></b></span>
+                <span>Speed limit</span>
+                <span class="row"><span id="dLimitBox" class="speedbox" title="Pick a preset or type your own: 750k, 2 MB/s… (plain numbers are KB/s, 0 = unlimited). Applies immediately."><input id="dLimit" type="text"><button title="Presets">▾</button></span><span class="hint">for this download only</span></span>
+                <span data-unfinished>When it's done</span>
+                <label data-unfinished class="check"><input type="checkbox" id="dOpenDone"><span>Open it</span></label>
+                <span data-http>Backup links</span>
+                <span data-http class="row"><span id="dMirrors"></span><button class="small" id="dAddMirror" title="Another link for the same file — used in parallel, and as a fallback if the main link dies">Add…</button></span>
+              </div>
+              <div id="dTorrent" class="hint" data-torrent-only></div>
+              <div data-http>
+                <div class="hint" style="margin:10px 0 4px">Expected checksum (MD5 / SHA-1 / SHA-256 / SHA-512)</div>
+                <input id="dHash" type="text" class="mono" style="width:100%" spellcheck="false">
+              </div>
+              <div class="row wrap" style="margin-top:12px">
+                <button id="dOpen">Open</button>
+                <button id="dFolder">Show in folder</button>
+                <button id="dRefresh" data-http title="Swap in a fresh link for an expired one and keep the downloaded bytes">Refresh link…</button>
+                <button id="dCopy">Copy URL</button>
+              </div>
+            </div>
+            <div class="split-v thin" id="splitGen"></div>
+            <div id="genRight">
+              <div class="row"><span class="muted">File map</span><span class="grow"></span><span id="segInfo" class="hint"></span></div>
+              <canvas id="segBar" height="26"></canvas>
+              <div class="hint" id="segHint">Blue = downloaded, green = a live connection writing. Finished connections steal work from slow ones.</div>
+              <div class="muted" style="margin-top:14px">Speed — last 60 seconds</div>
+              <canvas id="graph" height="112"></canvas>
+            </div>
+          </div>
+          <div class="tabpage" id="tab-trackers" hidden><table class="mini" id="trackerTable"></table></div>
+          <div class="tabpage" id="tab-peers" hidden><div id="peerSummary" class="hint"></div><table class="mini" id="peerTable"></table></div>
+          <div class="tabpage" id="tab-content" hidden><table class="mini" id="fileTable"></table></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <footer id="status">
+    <span id="statusLeft" class="ell grow"></span>
+    <span id="statusTorrent" class="muted" title="BitTorrent engine — DHT lets FluxDM find peers for magnet links without a tracker"></span>
+    <span class="muted">Global speed limit</span>
+    <div id="limitBox" class="speedbox" title="Pick a preset or type your own: 750, 750k, 2 MB/s, 2.5m… (plain numbers are KB/s, 0 = unlimited)">
+      <input id="limitInput" type="text" spellcheck="false">
+      <button id="limitDrop" title="Presets">▾</button>
+    </div>
+  </footer>
+</div>
+<div id="dropHint" hidden><div>Drop links, a .txt of links or .torrent files</div></div>
+<script src="guard.js"></script>
+<script src="common.js"></script>
+<script src="main.js"></script>
+</body>
+</html>

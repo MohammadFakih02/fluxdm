@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>FluxDM</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/32.png" width="22" height="22" alt="">
+    <strong>FluxDM</strong>
+    <span id="status" class="pill">checking…</span>
+  </header>
+
+  <div id="perm" class="banner" hidden>
+    The extension needs access to websites to catch downloads and send cookies.
+    <button id="grant">Allow access</button>
+  </div>
+
+  <section class="card">
+    <label class="row">
+      <span><b>Catch browser downloads</b><small>Download buttons and links go to FluxDM</small></span>
+      <input type="checkbox" id="enabled" class="switch">
+    </label>
+    <label class="row">
+      <span><b>Start immediately</b><small>Skip FluxDM's confirmation dialog</small></span>
+      <input type="checkbox" id="autostart" class="switch">
+    </label>
+  </section>
+
+  <section class="buttons">
+    <button id="grab" class="primary">Grab download links on this page</button>
+    <button id="video">Download this page's video (YouTube etc.)</button>
+    <button id="sendPage">Send this page's address</button>
+    <button id="skipNext">Let my next download go to the browser</button>
+  </section>
+
+  <details>
+    <summary>Options</summary>
+    <label class="check"><input type="checkbox" id="allTypes"> Catch every file type</label>
+    <label class="field" id="extsLabel" title="Used when “Catch every file type” is off, and by “Grab download links”">File types to catch
+      <textarea id="exts" rows="3" spellcheck="false"></textarea>
+    </label>
+    <label class="field inline">Also catch any file over
+      <input id="bigFileMB" type="number" min="0" step="10"> MB <small>(0 = off)</small>
+    </label>
+    <label class="check"><input type="checkbox" id="sendCookies"> Send cookies (for sites that need a login)</label>
+    <label class="check"><input type="checkbox" id="sendUserAgent"> Send the browser's User-Agent</label>
+    <label class="field inline">FluxDM port <input id="port" type="number" min="1024" max="65535"></label>
+  </details>
+
+  <details id="activityBox">
+    <summary>Recent activity</summary>
+    <ul id="activity"></ul>
+  </details>
+
+  <p id="msg" role="status"></p>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
