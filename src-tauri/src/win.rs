@@ -83,6 +83,17 @@ pub fn recycle(path: &str) {
     }
 }
 
+/// Waits (up to `max`) for another process to end. Returns at once if it is already gone.
+pub fn wait_for_exit(pid: u32, max: std::time::Duration) {
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    unsafe {
+        if let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            WaitForSingleObject(h, max.as_millis().min(u32::MAX as u128) as u32);
+            let _ = windows::Win32::Foundation::CloseHandle(h);
+        }
+    }
+}
+
 // ------------------------------------------------------------------ power
 
 static AWAKE: LazyLock<StdMutex<Sender<bool>>> = LazyLock::new(|| {
@@ -334,6 +345,10 @@ pub fn set_magnet_handler(on: bool, backup: &mut Option<String>) -> bool {
         }
         true
     } else {
+        // No record of what was there before (e.g. the settings were reset): at least stop pointing at FluxDM.
+        if magnet_command().is_some_and(|c| c.to_lowercase().contains(&exe().to_lowercase())) {
+            let _ = hkcu.delete_subkey_all(MAGNET_KEY);
+        }
         true
     }
 }

@@ -67,6 +67,11 @@ async fn c<T>(run: &Run, fut: impl std::future::Future<Output = T>) -> DlResult<
     }
 }
 
+/// A problem on this PC (disk full, folder not writable…), not with the link.
+fn local_fault(e: &DlError) -> bool {
+    e.fatal && matches!(e.kind, ErrKind::DiskFull | ErrKind::Io)
+}
+
 fn backoff(attempt: i32) -> Duration {
     let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_millis()).unwrap_or(0) as u64;
     Duration::from_secs(2f64.powi(attempt.min(5)).min(30.0) as u64) + Duration::from_millis(jitter)
@@ -565,6 +570,11 @@ impl Ctx {
                     break;
                 }
                 Err(e) if e.kind == ErrKind::Cancelled || self.run.is_cancelled() => break,
+                Err(e) if local_fault(&e) => {
+                    // Disk full, access denied…: no link can help, and none of them is to blame.
+                    self.set_fatal(e);
+                    break;
+                }
                 Err(e) => {
                     if e.fatal {
                         // This link is unusable; carry on with the others if any remain.
@@ -741,6 +751,7 @@ impl Ctx {
             match r {
                 Ok(()) => return Ok(()),
                 Err(e) if e.kind == ErrKind::Cancelled || self.run.is_cancelled() => return Err(DlError::cancelled()),
+                Err(e) if local_fault(&e) => return Err(e),
                 Err(e) => {
                     if e.fatal && self.url_count() > 1 {
                         if !self.mark_dead(link, &e) {

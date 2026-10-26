@@ -51,6 +51,8 @@ function fmtLimit(k) {
 const LIMIT_PRESETS = [["Unlimited", 0], ["64 KB/s", 64], ["128 KB/s", 128], ["192 KB/s", 192], ["256 KB/s", 256], ["384 KB/s", 384], ["512 KB/s", 512], ["768 KB/s", 768],
   ["1 MB/s", 1024], ["1.5 MB/s", 1536], ["2 MB/s", 2048], ["3 MB/s", 3072], ["4 MB/s", 4096], ["5 MB/s", 5120], ["7.5 MB/s", 7680],
   ["10 MB/s", 10240], ["15 MB/s", 15360], ["20 MB/s", 20480], ["25 MB/s", 25600], ["50 MB/s", 51200]];
+// Torrent upload presets (KB/s; -1 = no upload at all).
+const UPLOAD_PRESETS = [["Unlimited", 0], ["No upload", -1], ["20 KB/s", 20], ["50 KB/s", 50], ["100 KB/s", 100], ["128 KB/s", 128], ["192 KB/s", 192], ["256 KB/s", 256], ["384 KB/s", 384], ["512 KB/s", 512], ["768 KB/s", 768], ["1 MB/s", 1024], ["1.5 MB/s", 1536], ["2 MB/s", 2048], ["3 MB/s", 3072], ["5 MB/s", 5120], ["10 MB/s", 10240]];
 
 /** "750k", "2 MB/s", "2.5m", "0", "unlimited" → KB/s (0 = unlimited; -1 = none when allowNone). null if unreadable. */
 function parseSpeed(text, allowNone = false) {
@@ -70,13 +72,14 @@ function parseSpeed(text, allowNone = false) {
  * A speed box: type any speed, or pick a preset from the ▾ menu. `box` is a `.speedbox` holding an input and a button.
  * get() returns the current KB/s; set(kbps) is called when the user commits a different, valid value.
  * Returns { show() } to redraw the box from get() (skipped while the user is typing in it).
+ * allowNone: "No upload" (-1) is a valid value (upload limits).
  */
-function speedCombo(box, { get, set, presets = LIMIT_PRESETS }) {
+function speedCombo(box, { get, set, presets = LIMIT_PRESETS, allowNone = false }) {
   const input = $("input", box), drop = $("button", box);
   input.spellcheck = false;
   const show = () => { if (document.activeElement !== input) { input.value = fmtLimit(get()); input.classList.remove("invalid"); } };
   const commit = () => {
-    const v = parseSpeed(input.value);
+    const v = parseSpeed(input.value, allowNone);
     if (v == null) { input.classList.add("invalid"); return false; }
     input.classList.remove("invalid");
     if (v !== get()) set(v);

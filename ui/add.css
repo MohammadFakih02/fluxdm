@@ -48,6 +48,7 @@ body { background: var(--panel); }
 .grid label.check { padding: 0; align-items: center; }
 .grid label.check input { margin: 0; }
 #add.torrent [data-notorrent], #add.torrent #advanced, #add.torrent #videoBlock { display: none; }
+#add:not(.torrent) [data-torrentonly] { display: none; }
 #advanced summary { cursor: default; color: var(--text-2); padding: 4px 0; }
 #advanced summary:hover { color: var(--text); }
 #advanced textarea { width: 100%; }

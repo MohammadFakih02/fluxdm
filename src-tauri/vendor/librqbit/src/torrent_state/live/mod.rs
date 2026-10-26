@@ -526,6 +526,16 @@ impl TorrentStateLive {
         )>,
     ) -> crate::Result<()> {
         while let Some((tx, ci)) = rx.recv().await {
+            // FluxDM patch: "no upload" (torrent or session upload limit of 1 B/s) drops the request unanswered.
+            if self.ratelimits.upload_blocked()
+                || self
+                    .shared
+                    .session
+                    .upgrade()
+                    .is_some_and(|s| s.ratelimits.upload_blocked())
+            {
+                continue;
+            }
             tokio::select! {
                 _ = tx.closed() => {
                     continue;

@@ -180,6 +180,7 @@ be a much bigger job, its crates were copied into `src-tauri/vendor/` and patche
 - **Availability column:** turns red below 1.00, meaning some piece isn't on any connected peer.
 - **Peer turnover:** swaps out useless peers when all connection slots are full.
 - **Download in order:** `ManagedTorrent::set_sequential` makes the piece picker hand out pieces from the start of each file to the end instead of first, last, then the middle.
+- **Slow limits and No upload:** the limiter's bucket holds at least two 16 KB blocks, so limits under 32 KB/s work as set, and an upload limit of 1 B/s means *answer no requests* (stock librqbit refused such a limit and ended the torrent's upload task).
 
 The one remaining difference from the old app is that there's no upload-slot limit. The upload speed limit
 still applies. For upgrading librqbit later, follow `vendor/PATCHES.md`.
@@ -244,6 +245,8 @@ a different bridge port in its `settings.json` (`LocalApiPort`, for example `178
 | Torrents are slow or have few peers | Allow FluxDM through the firewall when it asks at the first torrent start. Without that, nobody can connect to you. |
 | A torrent's file is "in use" | Finished files are held read-only, so other programs can open them. To edit, move or delete one yourself, remove the torrent from FluxDM first. |
 | Magnet links still open another app | Windows keeps its own default above FluxDM's registry entry. Use Settings → Torrents → *Make FluxDM the magnet handler*; it opens Default apps, where you choose FluxDM for MAGNET. |
+| Magnet links keep opening FluxDM after *Give magnet links back* | FluxDM was picked in Windows' Default apps, which outranks the registry entry FluxDM restores. FluxDM opens Default apps for you: choose another app for MAGNET there. |
+| A finished torrent no longer shares | Right-click → *Resume sharing*. It shares until the seed ratio; it refuses (and says why in the status) when the ratio is reached, the seeding limit is *No upload*, or files were moved or deleted (*Force recheck* fetches what's missing). |
 | The window is blank (white or black) | Tray icon → *Reload window*. FluxDM also repaints a freshly shown window and nudges one that goes quiet. Details are in `src-tauri/src/webview_guard.rs`. |
 | A toast pulled me out of my game | Toasts are shown without taking focus (the window is non-focusable, and if the webview still grabs focus FluxDM gives the foreground back to the previous window within about 0.7 s). Each shows for about 6 s (longer while the mouse is on it, at most 15 s); if the page ever stops answering, FluxDM hides it after 25 s. Exclusive-fullscreen games can't show any overlay. Clicking a toast opens FluxDM on purpose. |
 | Set location on a half-finished torrent is slow | Unfinished torrents have full-size placeholder files. Across drives FluxDM offers to delete them and start over in the new folder instead of copying. |

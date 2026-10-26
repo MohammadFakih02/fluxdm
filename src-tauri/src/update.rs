@@ -77,6 +77,9 @@ pub async fn check(repo: &str) -> Result<Option<Release>, String> {
     }))
 }
 
+/// How long the update download may go without receiving anything.
+const STALL: Duration = Duration::from_secs(60);
+
 fn exe_path() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| e.to_string())
 }
@@ -94,13 +97,15 @@ pub async fn install(rel: &Release, progress: impl Fn(f64)) -> Result<PathBuf, S
         return Err("The release's checksum file is not a SHA-256".into());
     }
 
-    let mut resp = net::HTTP.get(&rel.exe_url).send().await.map_err(|e| e.to_string())?;
+    // A connection that goes silent must end in an error the window can show, not a "Downloading…" that never ends.
+    let stalled = || "The download stopped (no data for 60 seconds) — check your connection and try again.".to_string();
+    let mut resp = tokio::time::timeout(STALL, net::HTTP.get(&rel.exe_url).send()).await.map_err(|_| stalled())?.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("Download failed ({})", resp.status()));
     }
     let total = resp.content_length().unwrap_or(rel.size) as f64;
     let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+    while let Some(chunk) = tokio::time::timeout(STALL, resp.chunk()).await.map_err(|_| stalled())?.map_err(|e| e.to_string())? {
         buf.extend_from_slice(&chunk);
         if total > 0.0 {
             progress(buf.len() as f64 * 100.0 / total);

@@ -151,8 +151,10 @@ $("#pauseAll").onclick = () => api("all", { action: "pause" }).then(refresh);
 $("#resumeAll").onclick = () => api("all", { action: "resume" }).then(refresh);
 $("#add").onclick = async () => {
   const url = $("#url").value.trim();
-  if (!/^https?:\/\//i.test(url)) { alert("Paste an http(s) link"); return; }
-  await api("add", { url, video: $("#video").checked });
+  // The PC takes magnet links too (they become torrents).
+  if (!/^(https?:\/\/|magnet:\?)/i.test(url)) { alert("Paste an http(s) or magnet link"); return; }
+  try { await api("add", { url, video: $("#video").checked }); }
+  catch (e) { if (e.message !== "pin" && e.message !== "locked") alert("FluxDM couldn't add that link (" + e.message + ")"); return; }
   $("#url").value = ""; refresh();
 };
 

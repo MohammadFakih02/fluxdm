@@ -439,16 +439,26 @@ async fn restart(mgr: M<'_>, ids: Vec<String>) -> R<()> {
 }
 
 #[tauri::command]
-fn clear_finished(mgr: M) -> usize {
-    let n = {
-        let mut st = mgr.st.lock();
-        let before = st.items.len();
-        st.items.retain(|i| i.status != DlStatus::Completed);
-        before - st.items.len()
+async fn clear_finished(mgr: M<'_>) -> R<usize> {
+    let m = mgr.inner().clone();
+    let cleared: Vec<Item> = {
+        let mut st = m.st.lock();
+        let (done, keep): (Vec<Item>, Vec<Item>) = std::mem::take(&mut st.items).into_iter().partition(|i| i.status == DlStatus::Completed);
+        st.items = keep;
+        done
     };
-    mgr.save();
-    mgr.push_list();
-    n
+    // A finished torrent may still be seeding: take it out of the engine too (its files stay), or it would keep
+    // uploading with no row left to see or stop it.
+    for it in cleared.iter().filter(|i| i.is_torrent) {
+        m.torrents.remove(&m, it, false).await;
+        let still_used = m.st.lock().items.iter().any(|o| o.torrent_file == it.torrent_file);
+        if !still_used && !it.torrent_file.is_empty() {
+            let _ = std::fs::remove_file(&it.torrent_file);
+        }
+    }
+    m.save();
+    m.push_list();
+    Ok(cleared.len())
 }
 
 /// Changes simple fields of one or more downloads.
@@ -791,6 +801,11 @@ struct AddSubmit {
     folder_edited: bool,
     connections: i32,
     limit_kbps: i32,
+    /// Torrents: their own upload limits while downloading / once finished (KB/s, 0 = none of its own, -1 = no upload).
+    #[serde(default)]
+    upload_limit_kbps: i32,
+    #[serde(default)]
+    seeding_limit_kbps: i32,
     queue: String,
     headers: String,
     hash: String,
@@ -838,6 +853,8 @@ fn add_submit(app: AppHandle, mgr: M, req: AddSubmit) -> R<()> {
                     it.total_size = req.wanted_size.unwrap_or(-1);
                 }
                 it.speed_limit_kbps = req.limit_kbps;
+                it.upload_limit_kbps = req.upload_limit_kbps.max(-1);
+                it.seeding_limit_kbps = req.seeding_limit_kbps.max(-1);
                 it.queue_name = req.queue.clone();
                 items.push(it);
             }
@@ -897,6 +914,8 @@ fn add_submit(app: AppHandle, mgr: M, req: AddSubmit) -> R<()> {
 #[tauri::command]
 async fn torrent_recheck(mgr: M<'_>, ids: Vec<String>) -> R<()> {
     let m = mgr.inner().clone();
+    // One torrent that can't be checked must not leave the others in the selection unchecked.
+    let mut failed: Vec<String> = vec![];
     for id in ids {
         let Some(it) = m.item(&id) else { continue };
         if it.status == DlStatus::Verifying {
@@ -917,19 +936,25 @@ async fn torrent_recheck(mgr: M<'_>, ids: Vec<String>) -> R<()> {
                 m.with_item(&id, |it| {
                     it.downloaded = (pct.clamp(0.0, 100.0) / 100.0 * it.total_size as f64) as i64;
                     it.status = if done { DlStatus::Completed } else { DlStatus::Paused };
+                    if done && it.completed_at.is_none() {
+                        it.completed_at = Some(chrono::Local::now());
+                    }
                 });
                 if !done && resume {
                     m.start(&id);
                 }
             }
             Err(e) => {
-                m.with_item(&id, |it| it.status = DlStatus::Paused);
-                return Err(format!("Couldn't recheck “{}”: {}", it.file_name, e.msg));
+                // Nothing was checked: a finished torrent stays finished (Paused would make Resume download it again).
+                let before = if it.status == DlStatus::Completed { DlStatus::Completed } else { DlStatus::Paused };
+                m.with_item(&id, |x| x.status = before);
+                failed.push(format!("Couldn't recheck “{}”: {}", it.file_name, e.msg));
             }
         }
         m.save();
     }
-    Ok(())
+    m.push_list();
+    if failed.is_empty() { Ok(()) } else { Err(failed.join("\n")) }
 }
 
 /// Asks trackers and DHT for peers again: re-adding a running torrent makes librqbit announce afresh.
@@ -1435,12 +1460,13 @@ fn magnet_toggle(mgr: M) -> R<Value> {
     }
     mgr.save();
     let ours = win::is_magnet_handler();
-    // Windows keeps a default the user picked in Settings above our registry entry — send them there.
-    let needs_settings = turning_on && !ours;
+    // Windows keeps a default the user picked in Settings above our registry entry — send them there. That works
+    // both ways: once FluxDM was chosen there, giving magnet links back also has to happen there.
+    let needs_settings = turning_on != ours;
     if needs_settings {
         win::open_default_apps();
     }
-    Ok(json!({ "ours": ours, "name": win::magnet_handler_name(), "needsSettings": needs_settings }))
+    Ok(json!({ "ours": ours, "name": win::magnet_handler_name(), "needsSettings": needs_settings, "turningOn": turning_on }))
 }
 
 #[tauri::command]
@@ -1509,7 +1535,8 @@ async fn install_update(app: AppHandle, release: update::Release) -> R<()> {
     api::stop_local();
     api::stop_remote();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let _ = std::process::Command::new(exe).arg("--updated").spawn();
+    // The new copy waits for this process to be gone (see main), or it would hand itself over to us and quit.
+    let _ = std::process::Command::new(exe).arg(format!("--updated={}", std::process::id())).spawn();
     app.exit(0);
     Ok(())
 }
@@ -1521,6 +1548,11 @@ fn main() {
     let wants_exit = args.iter().any(|a| a.eq_ignore_ascii_case("--exit"));
     let tray_only = args.iter().any(|a| a == "--tray");
     let first_url = args.iter().skip(1).find(|a| net::is_download_source(a)).cloned();
+    // Started by the updater: the old copy may still be closing. While its single-instance window exists, this
+    // copy would pass its arguments to it and quit, leaving no FluxDM running at all.
+    if let Some(pid) = args.iter().find_map(|a| a.strip_prefix("--updated=")).and_then(|p| p.parse::<u32>().ok()) {
+        win::wait_for_exit(pid, Duration::from_secs(20));
+    }
     update::cleanup_old();
     // Crashes go to error.log in the data folder, like the .NET build's unhandled-exception handlers.
     let default_hook = std::panic::take_hook();

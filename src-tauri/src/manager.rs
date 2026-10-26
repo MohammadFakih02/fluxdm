@@ -432,6 +432,14 @@ impl Manager {
             let st = self.st.lock();
             let Some(it) = st.items.iter().find(|i| i.id == id) else { return };
             if it.status == DlStatus::Completed {
+                // A finished torrent: Resume means share it again (Pause stopped that).
+                if it.is_torrent {
+                    let (mgr, id) = (self.clone(), id.to_string());
+                    tauri::async_runtime::spawn(async move {
+                        mgr.torrents.resume_seeding(&mgr, &id).await;
+                        mgr.push_list();
+                    });
+                }
                 return;
             }
             (it.kind(), it.speed_limit_kbps, it.queue_name.clone())

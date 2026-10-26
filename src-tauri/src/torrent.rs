@@ -24,8 +24,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// librqbit's limiter can't pass a 16 KB block below this rate.
-const MIN_RATE: i64 = 32 * 1024;
+/// Lowest limit handed to the engine. Its patched limiter passes 16 KB blocks at any rate (vendor/PATCHES.md);
+/// this only keeps a typo like "1" (1 KB/s) from leaving peers waiting many seconds per block.
+const MIN_RATE: i64 = 4 * 1024;
+/// "No upload": the patched engine reads an upload limit of 1 B/s as "answer no requests" (vendor/PATCHES.md).
+/// Going through `rate()` would have raised it to MIN_RATE, i.e. 32 KB/s of upload.
+const NO_UPLOAD: Option<NonZeroU32> = NonZeroU32::new(1);
 
 #[derive(Default)]
 pub struct Service {
@@ -112,6 +116,8 @@ fn anyhow_err(e: anyhow::Error) -> DlError {
 pub struct Meta {
     pub name: String,
     pub files: Vec<(String, u64)>,
+    /// BEP 47 padding entries (same indexes as `files`): never written to disk.
+    pub padding: Vec<bool>,
     pub multi: bool,
     pub hash: String,
     pub trackers: Vec<String>,
@@ -128,6 +134,7 @@ pub fn parse(bytes: &[u8]) -> DlResult<Meta> {
     let name = info.name().map(|n| n.into_owned()).unwrap_or_else(|| "Torrent".into());
     // Every file, padding included, so indexes match the engine's (only_files / file_progress).
     let files: Vec<(String, u64)> = info.iter_file_details().map(|fd| (fd.filename.to_string(), fd.len)).collect();
+    let padding: Vec<bool> = info.iter_file_details().map(|fd| fd.attrs().padding).collect();
     let mut trackers: Vec<String> = vec![];
     let mut tiers: Vec<usize> = vec![];
     for (n, tier) in t.announce_list.iter().enumerate() {
@@ -149,7 +156,7 @@ pub fn parse(bytes: &[u8]) -> DlResult<Meta> {
         }
     }
     let size = files.iter().map(|f| f.1).sum();
-    Ok(Meta { name, multi, files, hash: t.info_hash.as_string(), trackers, tiers, size })
+    Ok(Meta { name, multi, files, padding, hash: t.info_hash.as_string(), trackers, tiers, size })
 }
 
 /// Where a torrent's files go: a multi-file torrent gets its own folder (like qBittorrent/MonoTorrent did).
@@ -355,6 +362,57 @@ impl Service {
                 }
             }
         }
+    }
+
+    /// "Resume" on a finished torrent: share it again until the seed ratio (Pause stops it; after a restart the
+    /// engine starts with everything paused). Only when every wanted file is still there at its full size, so a
+    /// torrent whose files were deleted or moved can't quietly start downloading again under "Complete".
+    pub async fn resume_seeding(&self, mgr: &Arc<Manager>, id: &str) {
+        let Some(it) = mgr.item(id) else { return };
+        let note = |n: String| {
+            mgr.with_item(id, |x| x.note = n);
+        };
+        let s = mgr.settings();
+        let target = s.torrent_seed_ratio;
+        if target <= 0.0 {
+            return note("not shared (Settings → Torrents → keep sharing until ratio is 0)".into());
+        }
+        if it.seeding_limit_kbps < 0 || s.torrent_seeding_limit_kbps < 0 {
+            return note("not shared (seeding limit is No upload)".into());
+        }
+        if it.ratio() >= target {
+            return note(format!("already shared {:.2}× (target {target})", it.ratio()));
+        }
+        let Some((bytes, meta)) = std::fs::read(&it.torrent_file).ok().and_then(|b| parse(&b).ok().map(|m| (b, m))) else {
+            return note("can't share: this torrent's info file is missing".into());
+        };
+        let folder = output_folder(&it, &meta);
+        let skipped: HashSet<i32> = it.skipped_files.iter().copied().collect();
+        let missing = meta
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, len))| *len > 0 && !skipped.contains(&(*i as i32)) && !meta.padding.get(*i).copied().unwrap_or(false))
+            .any(|(_, (p, len))| std::fs::metadata(Path::new(&folder).join(p)).map(|m| m.len() != *len).unwrap_or(true));
+        if missing {
+            return note("can't share: some of its files were moved or deleted (Force recheck to download them again)".into());
+        }
+        let r: DlResult<()> = async {
+            let session = self.session(mgr).await?;
+            let h = match self.find(&meta.hash) {
+                Some(h) => h,
+                None => self.add(&session, bytes, &meta, &folder, &it, 0, false).await?,
+            };
+            if h.is_paused() {
+                session.unpause(&h).await.map_err(anyhow_err)?;
+            }
+            Ok(())
+        }
+        .await;
+        note(match r {
+            Ok(()) => "seeding".into(),
+            Err(e) => format!("couldn't start sharing: {}", e.msg),
+        });
     }
 
     pub async fn stop_seeding(&self, mgr: &Arc<Manager>, id: &str) {
@@ -649,7 +707,7 @@ impl Service {
         let items: Vec<Item> = mgr.st.lock().items.iter().filter(|i| i.is_torrent && !i.info_hash.is_empty()).cloned().collect();
         let downloading = items.iter().any(|i| i.is_torrent && i.status == DlStatus::Downloading);
         let up = if downloading { s.torrent_upload_limit_kbps } else { s.torrent_seeding_limit_kbps };
-        session.ratelimits.set_upload_bps(if up < 0 { rate(1) } else { rate(up as i64 * 1024) });
+        session.ratelimits.set_upload_bps(if up < 0 { NO_UPLOAD } else { rate(up as i64 * 1024) });
 
         // Per-torrent limits apply live; the session-wide ones above stack on top.
         for it in &items {
@@ -666,6 +724,14 @@ impl Service {
         for it in items.iter().filter(|i| i.status == DlStatus::Completed && !mgr.is_running(&i.id)) {
             let Some(h) = self.find(&it.info_hash) else { continue };
             if h.is_paused() {
+                continue;
+            }
+            // Shared from disk but not all there (files changed since it finished): stop rather than download
+            // behind a "Complete" row. Force recheck is the way to fetch what's missing.
+            let now = h.stats();
+            if matches!(now.state, librqbit::TorrentStatsState::Live) && !now.finished {
+                let _ = session.pause(&h).await;
+                mgr.with_item(&it.id, |x| x.note = "stopped sharing: some data on disk doesn't match (Force recheck downloads it again)".into());
                 continue;
             }
             let hex = it.info_hash.to_lowercase();
@@ -689,9 +755,20 @@ impl Service {
                     (x.ratio(), h.stats().live.map(|l| l.snapshot.peer_stats.live).unwrap_or(0))
                 })
                 .unwrap_or((0.0, 0));
-            if target <= 0.0 || ratio >= target {
+            // A seeding limit of "No upload" (its own, or the one in Settings) means: don't share it once finished.
+            // Kept loaded, it would only sit there as "seeding" while sending nothing, its ratio never growing.
+            let no_seed = it.seeding_limit_kbps < 0 || s.torrent_seeding_limit_kbps < 0;
+            if target <= 0.0 || ratio >= target || no_seed {
                 let _ = session.pause(&h).await;
-                mgr.with_item(&it.id, |x| x.note = if ratio >= 0.01 { format!("shared {ratio:.2}×") } else { String::new() });
+                mgr.with_item(&it.id, |x| {
+                    x.note = if no_seed {
+                        "not shared (seeding limit is No upload)".into()
+                    } else if ratio >= 0.01 {
+                        format!("shared {ratio:.2}×")
+                    } else {
+                        String::new()
+                    }
+                });
             } else {
                 mgr.with_item(&it.id, |x| {
                     x.connected_peers = peers as i32;
@@ -808,11 +885,11 @@ fn own_down_limit(mgr: &Arc<Manager>, it: &Item) -> i64 {
     best
 }
 
-/// A per-item upload limit in KB/s (0 = none, negative = the slowest the engine allows) as bytes/s.
+/// A per-item upload limit in KB/s (0 = none, negative = no upload at all) as bytes/s.
 fn up_limit_bps(kbps: i32) -> Option<NonZeroU32> {
     match kbps {
         0 => None,
-        k if k < 0 => rate(1),
+        k if k < 0 => NO_UPLOAD,
         k => rate(k as i64 * 1024),
     }
 }
@@ -933,7 +1010,10 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentH
         }
     }
 
-    let seed = mgr.settings().torrent_seed_ratio > 0.0;
+    let s = mgr.settings();
+    let own_seed_limit = mgr.with_item(&id, |it| it.seeding_limit_kbps).unwrap_or(0);
+    // Ratio 0, or a seeding limit of "No upload": it isn't shared once finished.
+    let seed = s.torrent_seed_ratio > 0.0 && own_seed_limit >= 0 && s.torrent_seeding_limit_kbps >= 0;
     if !seed {
         let _ = session.pause(&h).await;
     }

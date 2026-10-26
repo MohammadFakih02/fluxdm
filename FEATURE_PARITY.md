@@ -49,8 +49,8 @@ Audit of every feature in the .NET source (`FluxDM-source`, its `INFO.md`) again
 | Upload slots per torrent, global connection limit | ⚠️ not in the engine: it uploads to every interested peer, capped by the upload limit; per-torrent connection limit ✅ |
 | UPnP port mapping | ✅ |
 | Fast resume (no re-check after a clean quit) | ✅ librqbit fastresume + session persistence |
-| Seed until ratio, separate upload limits while downloading / while seeding, "No upload" | ✅ |
-| Per-torrent download/upload/seeding limits (right-click) | ✅ (a torrent re-adds itself to apply a new own limit) |
+| Seed until ratio, separate upload limits while downloading / while seeding, "No upload" | ✅ (2.2.1: "No upload" really sends nothing and limits under 32 KB/s work as set; before, both were raised to 32 KB/s) |
+| Per-torrent download/upload/seeding limits (right-click; in the Add window too since 2.2.1) | ✅ (a torrent re-adds itself to apply a new own limit) |
 | Force recheck, force reannounce, set location, add trackers, copy name/hash/magnet, export .torrent | ✅ |
 | Trackers tab: tier, seeds, leeches, message | ✅ tested: tier (numbered as before; the engine announces to all tiers at once), status, seeds, leeches, peers received, next announce, message |
 | Peers tab: address, connection, flags, client, progress, speeds, downloaded, uploaded | ✅ tested: all of them (speeds from the byte counters, progress from the peer's pieces, flags incoming/outgoing · seed · wants our data) |

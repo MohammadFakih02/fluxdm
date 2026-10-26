@@ -14,8 +14,11 @@ const A = {
 
 const win = T.window.getCurrentWindow();
 const urlsBox = $("#urls"), nameBox = $("#name"), folderBox = $("#folder"), info = $("#info");
-let limitKBps = 0;
+let limitKBps = 0, upKBps = 0, seedKBps = 0;
 speedCombo($("#limitBox"), { get: () => limitKBps, set: (k) => (limitKBps = k) });
+// Torrents only: this torrent's own upload limits (0 = only the ones in Settings apply, -1 = no upload).
+speedCombo($("#upBox"), { get: () => upKBps, set: (k) => (upKBps = k), presets: UPLOAD_PRESETS, allowNone: true });
+speedCombo($("#seedBox"), { get: () => seedKBps, set: (k) => (seedKBps = k), presets: UPLOAD_PRESETS, allowNone: true });
 $("#expand").innerHTML = icon("chev");
 $("#copyLink").innerHTML = icon("copy");
 
@@ -354,6 +357,9 @@ async function doSubmit(start) {
   if (limit == null) return alertBox("Add download", "Speed limit: type a number of KB/s, or something like 500k or 2 MB/s (0 = unlimited).");
   const single = cls.urls.length === 1;
   const mode = cls.torrent ? "torrent" : videoMode() ? "video" : "file";
+  const up = parseSpeed($("#upLimit").value, true), seed = parseSpeed($("#seedLimit").value, true);
+  if (mode === "torrent" && (up == null || seed == null))
+    return alertBox("Add download", "Upload limit: type a number of KB/s, something like 20k or 1 MB/s, “No upload”, or 0 for only the limits in Settings.");
   const tInfo = mode === "torrent" && single && A.torrent && A.probedUrl === cls.urls[0];
   const skipped = tInfo ? A.torrentFiles.filter((f) => !f.on).map((f) => f.index) : null;
   if (tInfo && skipped.length === A.torrentFiles.length) return alertBox("Add download", "Tick at least one file of the torrent to download.");
@@ -363,6 +369,7 @@ async function doSubmit(start) {
     name: nameBox.value, nameEdited: A.nameEdited,
     folder: folderBox.value, folderEdited: A.folderEdited,
     connections: +$("#conn").value, limitKbps: limit,
+    uploadLimitKbps: mode === "torrent" ? up : 0, seedingLimitKbps: mode === "torrent" ? seed : 0,
     queue: $("#queue").value,
     headers: $("#headers").value,
     hash: $("#hash").value,

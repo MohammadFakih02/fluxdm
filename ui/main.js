@@ -1,8 +1,6 @@
 // FluxDM main window: the download list, sidebar, details pane, and the Settings / Scheduler / Stats dialogs.
 "use strict";
 
-const UPLOAD_PRESETS = [["Unlimited", 0], ["No upload", -1], ["20 KB/s", 20], ["50 KB/s", 50], ["100 KB/s", 100], ["128 KB/s", 128], ["192 KB/s", 192], ["256 KB/s", 256], ["384 KB/s", 384], ["512 KB/s", 512], ["768 KB/s", 768], ["1 MB/s", 1024], ["1.5 MB/s", 1536], ["2 MB/s", 2048], ["3 MB/s", 3072], ["5 MB/s", 5120], ["10 MB/s", 10240]];
-
 const COLUMNS = [
   { k: "#", w: 42, help: "The row number", num: true },
   { k: "File name", w: 320, sort: (r) => r.name.toLowerCase() },
@@ -485,7 +483,8 @@ function moveCursor(delta, extend) {
 // ---------------------------------------------------------------- actions
 
 const act = {
-  resume: () => invoke("start", { ids: selected().filter((r) => r.status !== "Completed").map((r) => r.id) }),
+  // A finished torrent resumes sharing (Pause stopped it); other finished downloads have nothing to resume.
+  resume: () => invoke("start", { ids: selected().filter((r) => r.status !== "Completed" || r.torrent).map((r) => r.id) }),
   pause: () => invoke("pause", { ids: selIds() }),
   toggle: () => invoke("toggle", { ids: selIds() }),
   pauseAll: () => invoke("pause_all"),
@@ -658,8 +657,8 @@ async function rowMenu(x, y) {
     { label: "Open", key: "Enter", disabled: cur.status !== "Completed", click: act.open },
     { label: "Show in folder", click: act.folder },
     "-",
-    { label: "Resume", click: act.resume },
-    { label: "Pause", click: act.pause },
+    { label: torrents && sel.every((r) => r.status === "Completed") ? "Resume sharing" : "Resume", click: act.resume },
+    { label: torrents && sel.every((r) => r.status === "Completed") ? "Stop sharing" : "Pause", click: act.pause },
     { label: "Restart from zero", click: act.restart },
     !torrents && { label: "Refresh link…", click: act.refreshLink },
     { label: torrents ? "Limit download speed" : "Limit speed", sub: await limitMenuItems("Limit speed", "Download speed limit", "limitKBps", LIMIT_PRESETS, "limitKBps") },
@@ -957,7 +956,9 @@ async function openSettings() {
     try {
       const m = await invoke("magnet_toggle");
       showMag(m);
-      if (m.needsSettings) alertBox("Magnet links", "Windows still has another app set as the default for magnet: links. In the Default apps page that just opened, choose FluxDM for MAGNET.");
+      if (m.needsSettings) alertBox("Magnet links", m.turningOn
+        ? "Windows still has another app set as the default for magnet: links. In the Default apps page that just opened, choose FluxDM for MAGNET."
+        : "FluxDM was chosen for magnet: links in Windows' Default apps, so Windows keeps using it. In the Default apps page that just opened, choose another app for MAGNET.");
     } catch (e) { alertBox("Magnet links", String(e)); }
   });
 

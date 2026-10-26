@@ -113,13 +113,17 @@ pub async fn ensure_installed(status: impl Fn(String)) -> DlResult<()> {
 
 async fn fetch(url: &str, dest: &std::path::Path, progress: impl Fn(f64)) -> DlResult<()> {
     use tokio::io::AsyncWriteExt;
+    // A connection that goes silent must fail (and free the install lock), not leave every video waiting forever.
+    const STALL: std::time::Duration = std::time::Duration::from_secs(60);
+    let stalled = || DlError::timeout("The download of yt-dlp/ffmpeg stopped (no data for 60 seconds)");
     let tmp = dest.with_extension("tmp");
     // ffmpeg is ~100 MB: carry on from what an earlier, interrupted attempt left behind.
     let have = std::fs::metadata(&tmp).map(|m| m.len() as i64).unwrap_or(0);
-    let mut resp = net::build(url, "", "FluxDM/2.0", (have > 0).then_some((have, None)), reqwest::Method::GET).send().await?;
+    let send = |range| tokio::time::timeout(STALL, net::build(url, "", "FluxDM/2.0", range, reqwest::Method::GET).send());
+    let mut resp = send((have > 0).then_some((have, None))).await.map_err(|_| stalled())??;
     if resp.status().as_u16() == 416 {
         let _ = std::fs::remove_file(&tmp);
-        resp = net::build(url, "", "FluxDM/2.0", None, reqwest::Method::GET).send().await?;
+        resp = send(None).await.map_err(|_| stalled())??;
     }
     net::ensure_ok(&resp)?;
     let resumed = have > 0 && resp.status().as_u16() == 206;
@@ -131,7 +135,7 @@ async fn fetch(url: &str, dest: &std::path::Path, progress: impl Fn(f64)) -> DlR
         tokio::fs::File::create(&tmp).await?
     };
     let (mut got, mut last) = (start, -1f64);
-    while let Some(chunk) = resp.chunk().await? {
+    while let Some(chunk) = tokio::time::timeout(STALL, resp.chunk()).await.map_err(|_| stalled())?? {
         f.write_all(&chunk).await?;
         got += chunk.len() as f64;
         let pct = if total > 0.0 { got * 100.0 / total } else { 0.0 };

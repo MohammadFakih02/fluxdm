@@ -19,9 +19,17 @@ and self-contained.
 | **PEX shares incoming peers too, with BEP 11 flags** (seed / uTP / holepunch / reachable) | `librqbit-peer-protocol/src/extended/ut_pex.rs` (`from_addrs_with_flags`), `librqbit/src/torrent_state/live/mod.rs` (`pex_candidates`) | librqbit only shared peers it had dialed itself, so peers behind NAT (which only connect in) were never shared. Those are the peers hole-punching is for. |
 | **Live speed limits**: `ManagedTorrent::set_ratelimits` changes a running torrent's own limits; `Limit::set` ignores an unchanged value | `librqbit/src/limits.rs`, `torrent_state/mod.rs`, `torrent_state/live/mod.rs` | Changing a limit used to remove and re-add the torrent (a full disk re-check), and re-setting the session limit every second rebuilt its bucket, so the cap leaked a burst each second. |
 | **Sequential download**: `ManagedTorrent::set_sequential(bool)`; `ChunkTracker::iter_queued_pieces` walks each file from its first piece to its last when it is on (an `AtomicBool` in `ManagedTorrentOptions`, read on every piece request, so it can be flipped while running) | `librqbit/src/torrent_state/mod.rs`, `torrent_state/live/mod.rs` (`acquire_next_piece`), `piece_tracker.rs` (`set_sequential`), `chunk_tracker.rs` (`iter_queued_pieces`), `session.rs` | "Download in order" in the torrent menu. Stock librqbit always picks first, last, then the middle of each file. |
+| **Slow limits and "No upload"**: the limiter bucket holds at least 32 KB (`MIN_BURST`); an upload limit of 1 B/s sets `Limits::upload_blocked`, and `task_upload_scheduler` drops requests while the torrent's or the session's upload is blocked | `librqbit/src/limits.rs` (`is_block`, `upload_blocked`, `fluxdm_tests`), `torrent_state/live/mod.rs` (`task_upload_scheduler`), `src/tests/e2e_no_upload.rs` (new) | Governor refuses to pass more than one bucket at once, and the bucket was one second's worth: under 16 KB/s no 16 KB block could ever pass, the error ended the upload task, and uploads stayed dead even after the limit was raised. The app therefore raised every limit to 32 KB/s, so "No upload" and 20 KB/s both uploaded at 32 KB/s. |
 
 Tested on 2026-10-01:
 - **Unit tests:** the engine's own suites pass (librqbit 32, peer-protocol 23 including the new `ut_holepunch` codec test, tracker-comms 4).
 - **Live swarm:** tested on the Debian 13.7 netinst swarm. Seeds were counted, per-peer speeds and progress showed, and the tracker reported Working.
 - **Hole-punch interop:** relays running other clients answered our rendezvous requests with `connect`.
 - **File locking:** files of a finished, loaded torrent open with `FileShare.Read`. They were "in use" before.
+
+Tested on 2026-10-26 (limits patch): the engine's suites pass with the patched siblings (librqbit 36, including the
+new `limits::fluxdm_tests` and `tests::e2e_no_upload`). `e2e_no_upload` runs a local seeder with upload blocked:
+the downloader gets 0 bytes in 8 s while the seeder's torrent stays Live, then completes once the limit is lifted.
+The same test against the unpatched engine fails: the seeder never uploads again after the limit is lifted.
+Run them from a copy of `vendor/` with a `[patch.crates-io]` for `librqbit-peer-protocol` and
+`librqbit-tracker-comms` pointing at the sibling folders (testing in place would rewrite `librqbit/Cargo.lock`).

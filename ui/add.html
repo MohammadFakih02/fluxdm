@@ -49,12 +49,20 @@
       <div class="row"><input id="folder" type="text" class="grow" spellcheck="false"><button id="browse">Browse…</button></div>
       <span data-notorrent>Connections</span>
       <div data-notorrent class="row"><input id="conn" type="range" min="1" max="64" class="grow"><b id="connVal" style="width:26px;text-align:right"></b></div>
-      <span>Speed limit</span>
+      <span data-notorrent>Speed limit</span>
+      <span data-torrentonly>Download limit</span>
       <div class="row">
         <span id="limitBox" class="speedbox" title="Pick a preset or type your own: 750k, 2 MB/s… (plain numbers are KB/s, 0 = unlimited)"><input id="limit" type="text"><button title="Presets">▾</button></span>
         <span class="grow"></span>
         <span class="muted">Queue</span>
         <select id="queue" style="min-width:170px"></select>
+      </div>
+      <span data-torrentonly>Upload limit</span>
+      <div data-torrentonly class="row wrap">
+        <span class="muted">while downloading</span>
+        <span id="upBox" class="speedbox" title="How fast this torrent shares while it's still downloading. Type 20k, 1 MB/s… or pick “No upload”. Unlimited = only the limits in Settings apply."><input id="upLimit" type="text"><button title="Presets">▾</button></span>
+        <span class="muted">when finished</span>
+        <span id="seedBox" class="speedbox" title="How fast it shares once it's finished (seeding). Type 20k, 1 MB/s… or pick “No upload”. Unlimited = only the limits in Settings apply."><input id="seedLimit" type="text"><button title="Presets">▾</button></span>
       </div>
       <span>When it's done</span>
       <label class="check"><input type="checkbox" id="openDone"><span>Open it</span></label>

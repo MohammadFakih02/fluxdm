@@ -46,7 +46,9 @@ current Windows 10. If it's missing, the setup installs it.
 - **Torrents:** magnet links, .torrent links and files, using librqbit.
   - TCP + µTP, DHT, UPnP and fast resume.
   - Pick which files to download.
-  - Separate upload limits while downloading and while seeding, and a seed-ratio target.
+  - Separate upload limits while downloading and while seeding (for all torrents, or per torrent in the Add window
+    and the right-click menu), with a real *No upload*, and a seed-ratio target.
+  - *Stop sharing* / *Resume sharing* on a finished torrent (right-click).
   - Force recheck/reannounce, move data, add trackers, export .torrent, copy the magnet link.
   - **Download in order** (right-click): fetches each file from its first piece to its last, so a video can be watched while it downloads.
   - Set location on an unfinished torrent moving to another drive offers to start over there instead of copying the full-size placeholder files.
