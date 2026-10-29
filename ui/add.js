@@ -23,6 +23,16 @@ $("#expand").innerHTML = icon("chev");
 $("#copyLink").innerHTML = icon("copy");
 
 (async function init() {
+  let ready = false;
+  async function appendLinks() {
+    if (!ready) return;
+    const links = await invoke("add_take_links");
+    if (!links.trim()) return;
+    urlsBox.value = [urlsBox.value.trim(), links.trim()].filter(Boolean).join("\n");
+    autoGrow();
+    refresh();
+  }
+  await win.listen("add-links", appendLinks);
   const d = (A.init = await invoke("add_init"));
   const st = (await invoke("get_settings")).settings;
   applyTheme(st.Theme);
@@ -47,17 +57,9 @@ $("#copyLink").innerHTML = icon("copy");
   urlsBox.focus();
   urlsBox.setSelectionRange(0, 0);
   toFirstLine();
-  listen("add-append", (req) => append(req.urls || ""));
+  ready = true;
+  await appendLinks();
 })();
-
-function append(text) {
-  const have = new Set(urlsBox.value.split("\n").map((l) => l.trim()));
-  const add = text.split("\n").map((l) => l.trim()).filter((l) => l && !have.has(l));
-  if (!add.length) return;
-  urlsBox.value = (urlsBox.value.trimEnd() + "\n" + add.join("\n")).trim();
-  autoGrow();
-  refresh();
-}
 
 // The link box is one line; the arrow opens it to every line (wrapped). A batch shows how many links it holds.
 function autoGrow() {
@@ -228,7 +230,7 @@ async function refreshTorrent(gen, urls) {
   setName(A.cls.magnetName || "");
   setInfo([src.toLowerCase().startsWith("magnet:") ? "Getting the torrent's info from peers… (usually a few seconds)" : "Reading the torrent…"]);
   try {
-    const t = await invoke("torrent_info", { source: src });
+    const t = await invoke("torrent_info", { source: src, headers: $("#headers").value });
     if (gen !== A.gen) return;
     A.torrent = t;
     A.probedUrl = src;

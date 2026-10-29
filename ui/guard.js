@@ -5,8 +5,13 @@
 (() => {
   const T = window.__TAURI__;
   if (!T || !T.core) return;
+  let pending = false;
   setInterval(() => {
-    if (document.hidden) return;
-    requestAnimationFrame(() => T.core.invoke("ui_heartbeat").catch(() => {}));
+    if (document.hidden || pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      T.core.invoke("ui_heartbeat").catch(() => {});
+    });
   }, 4000);
 })();

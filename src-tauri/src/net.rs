@@ -23,6 +23,7 @@ pub enum ErrKind {
     Io,
     DiskFull,
     Cancelled,
+    Changed,
     Other,
 }
 
@@ -43,7 +44,7 @@ impl DlError {
         match self.kind {
             ErrKind::Http | ErrKind::Other => !self.fatal && self.kind == ErrKind::Http,
             ErrKind::Network | ErrKind::Timeout | ErrKind::Io => !self.fatal,
-            ErrKind::DiskFull | ErrKind::Cancelled => false,
+            ErrKind::DiskFull | ErrKind::Cancelled | ErrKind::Changed => false,
         }
     }
 }
@@ -135,6 +136,25 @@ fn build_with(client: &Client, url: &str, headers: &str, ua: &str, range: Option
     client.request(method, url).headers(map)
 }
 
+/// Custom request headers belong only to the original origin, including across redirects.
+pub async fn get_scoped(source: &str, headers: &str, ua: &str) -> DlResult<Response> {
+    let origin = url::Url::parse(source).map_err(|e| DlError::fatal(e.to_string()))?;
+    let mut current = origin.clone();
+    for _ in 0..20 {
+        let resp = scoped_get(&origin, &current, headers, ua).send().await?;
+        if !resp.status().is_redirection() { return Ok(resp); }
+        let next = resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()).ok_or_else(|| DlError::fatal("Redirect has no location"))?;
+        current = current.join(next).map_err(|e| DlError::fatal(e.to_string()))?;
+        if !matches!(current.scheme(), "http" | "https") { return Err(DlError::fatal("Unsupported redirect")); }
+    }
+    Err(DlError::fatal("Too many redirects"))
+}
+
+fn scoped_get(origin: &url::Url, current: &url::Url, headers: &str, ua: &str) -> RequestBuilder {
+    let scoped = if current.origin() == origin.origin() { headers } else { "" };
+    build_with(&NO_REDIRECT, current.as_str(), scoped, ua, None, Method::GET)
+}
+
 /// Turns an HTTP error status into a DlError with a plain-words message.
 pub fn ensure_ok(resp: &Response) -> DlResult<()> {
     let st = resp.status();
@@ -166,10 +186,39 @@ pub fn content_range(resp: &Response) -> Option<(i64, i64, Option<i64>)> {
 
 #[derive(Debug, Clone)]
 pub struct Probe {
+    pub url: String,
     pub total: i64,
     pub resumable: bool,
     pub file_name: Option<String>,
     pub sha256: Option<String>,
+    pub validator: Option<String>,
+}
+
+pub fn validator(headers: &header::HeaderMap) -> Option<String> {
+    let etag = headers.get(header::ETAG).and_then(|v| v.to_str().ok()).map(str::trim);
+    etag.filter(|v| v.starts_with('"') && v.ends_with('"'))
+        .or_else(|| headers.get(header::LAST_MODIFIED).and_then(|v| v.to_str().ok()))
+        .map(str::to_string)
+}
+
+pub fn validator_changed(saved: Option<&str>, current: Option<&str>) -> bool {
+    matches!((saved, current), (Some(a), Some(b)) if a.starts_with('"') == b.starts_with('"') && a != b)
+}
+
+pub fn range_changed(saved: Option<&str>, status: StatusCode, headers: &header::HeaderMap) -> bool {
+    let current = if saved.is_some_and(|v| !v.starts_with('"')) {
+        headers.get(header::LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(str::to_string)
+    } else {
+        validator(headers)
+    };
+    saved.is_some() && (status == StatusCode::OK || validator_changed(saved, current.as_deref()))
+}
+
+pub fn if_range(req: RequestBuilder, validator: Option<&str>) -> RequestBuilder {
+    match validator {
+        Some(v) => req.header(header::IF_RANGE, v),
+        None => req,
+    }
 }
 
 /// Asks for the first byte range to learn size, resumability and the real file name.
@@ -199,8 +248,9 @@ pub async fn probe(url: &str, headers: &str, ua: &str, timeout_sec: i32) -> DlRe
                 name.push_str(ext);
             }
         }
+        let validator = validator(resp.headers());
         drop(resp);
-        Ok(Probe { total, resumable, file_name: Some(name), sha256: sha })
+        Ok(Probe { url: url.to_string(), total, resumable, file_name: Some(name), sha256: sha, validator })
     };
     match tokio::time::timeout(Duration::from_secs(timeout_sec.max(5) as u64), fut).await {
         Ok(r) => r,
@@ -389,6 +439,46 @@ pub fn host_of(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn torrent_fetch_headers_only_follow_same_origin_redirects() {
+        let origin = url::Url::parse("https://example.invalid/private.torrent").unwrap();
+        let headers = "Cookie: session=secret\nAuthorization: Bearer secret\nReferer: https://example.invalid/page\nX-Token: secret";
+        for destination in ["https://example.invalid/next", "https://cdn.invalid/next", "http://example.invalid/next", "https://example.invalid:444/next"] {
+            let current = url::Url::parse(destination).unwrap();
+            let req = scoped_get(&origin, &current, headers, "test").build().unwrap();
+            for name in ["cookie", "authorization", "referer", "x-token"] {
+                assert_eq!(req.headers().contains_key(name), origin.origin() == current.origin());
+            }
+            assert_eq!(req.method(), Method::GET);
+        }
+    }
+
+    #[test]
+    fn resume_validators() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::ETAG, header::HeaderValue::from_static("W/\"weak\""));
+        assert_eq!(validator(&headers), None);
+        headers.insert(header::LAST_MODIFIED, header::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        assert_eq!(validator(&headers).as_deref(), Some("Wed, 21 Oct 2015 07:28:00 GMT"));
+        headers.insert(header::ETAG, header::HeaderValue::from_static("\"strong\""));
+        assert_eq!(validator(&headers).as_deref(), Some("\"strong\""));
+        assert!(validator_changed(Some("\"old\""), Some("\"new\"")));
+        assert!(!validator_changed(None, Some("\"new\"")));
+        assert!(!validator_changed(Some("\"old\""), None));
+        assert!(!validator_changed(Some("\"old\""), Some("Wed, 21 Oct 2015 07:28:00 GMT")));
+        assert!(!validator_changed(Some("Wed, 21 Oct 2015 07:28:00 GMT"), Some("\"strong\"")));
+        assert!(range_changed(Some("\"strong\""), StatusCode::OK, &headers));
+        assert!(range_changed(Some("\"old\""), StatusCode::PARTIAL_CONTENT, &headers));
+        assert!(!range_changed(Some("\"strong\""), StatusCode::PARTIAL_CONTENT, &headers));
+        assert!(!range_changed(None, StatusCode::OK, &headers));
+        assert!(!range_changed(Some("Wed, 21 Oct 2015 07:28:00 GMT"), StatusCode::PARTIAL_CONTENT, &headers));
+        assert!(range_changed(Some("Tue, 20 Oct 2015 07:28:00 GMT"), StatusCode::PARTIAL_CONTENT, &headers));
+        let req = build("https://example.invalid/file", "", "test", Some((10, None)), Method::GET);
+        let req = if_range(req, Some("\"strong\"")).build().unwrap();
+        assert_eq!(req.headers()[header::IF_RANGE], "\"strong\"");
+        assert_eq!(req.headers()[header::RANGE], "bytes=10-");
+    }
 
     #[test]
     fn expands_ranges() {

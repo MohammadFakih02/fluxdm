@@ -10,23 +10,24 @@
 <div id="app">
   <header id="toolbar">
     <div class="tb-group">
-      <button id="btnAdd" class="primary" title="Add one or many links (Ctrl+N)"><span data-icon="add"></span>Add URL</button>
-      <button id="btnResume" class="ghost" title="Start / resume selected (Space)"><span data-icon="play"></span>Resume</button>
-      <button id="btnPause" class="ghost" title="Pause selected (Space)"><span data-icon="pause"></span>Pause</button>
-      <button id="btnPauseAll" class="ghost" title="Pause everything and stop all queues"><span data-icon="pauseAll"></span>Pause all</button>
-      <button id="btnDelete" class="ghost" title="Remove selected (Del)"><span data-icon="trash"></span>Delete</button>
-      <button id="btnClear" class="ghost" title="Remove all finished downloads from the list (files are kept)"><span data-icon="broom"></span>Clear finished</button>
+      <button id="btnAdd" class="primary" title="Add one or many links (Ctrl+N)" aria-label="Add URL"><span data-icon="add"></span><span class="tb-label">Add URL</span></button>
+      <button id="btnResume" class="ghost" title="Start / resume selected (Space)" aria-label="Resume"><span data-icon="play"></span><span class="tb-label">Resume</span></button>
+      <button id="btnPause" class="ghost" title="Pause selected (Space)" aria-label="Pause"><span data-icon="pause"></span><span class="tb-label">Pause</span></button>
+      <button id="btnPauseAll" class="ghost" title="Pause everything and stop all queues" aria-label="Pause all"><span data-icon="pauseAll"></span><span class="tb-label">Pause all</span></button>
+      <button id="btnDelete" class="ghost" title="Remove selected (Del)" aria-label="Delete"><span data-icon="trash"></span><span class="tb-label">Delete</span></button>
+      <button id="btnClear" class="ghost" title="Remove all finished downloads from the list (files are kept)" aria-label="Clear finished"><span data-icon="broom"></span><span class="tb-label">Clear finished</span></button>
       <span class="tb-sep"></span>
-      <button id="btnScheduler" class="ghost tb-2" title="Queues and scheduler"><span data-icon="clock"></span>Scheduler</button>
-      <button id="btnStats" class="ghost tb-2" title="How much you downloaded per day and month"><span data-icon="chart"></span>Stats</button>
-      <button id="btnColumns" class="ghost tb-2" title="Choose which columns the list shows"><span data-icon="columns"></span>Columns</button>
-      <button id="btnSettings" class="ghost tb-2" title="Settings"><span data-icon="gear"></span>Settings</button>
+      <button id="btnScheduler" class="ghost tb-2" title="Queues and scheduler" aria-label="Scheduler"><span data-icon="clock"></span><span class="tb-label">Scheduler</span></button>
+      <button id="btnStats" class="ghost tb-2" title="How much you downloaded per day and month" aria-label="Stats"><span data-icon="chart"></span><span class="tb-label">Stats</span></button>
+      <button id="btnColumns" class="ghost tb-2" title="Choose which columns the list shows" aria-label="Columns"><span data-icon="columns"></span><span class="tb-label">Columns</span></button>
+      <button id="btnSettings" class="ghost tb-2" title="Settings" aria-label="Settings"><span data-icon="gear"></span><span class="tb-label">Settings</span></button>
+      <button id="btnMore" class="ghost" title="More actions" aria-label="More actions" aria-haspopup="menu" hidden>&#8943;</button>
     </div>
     <div id="updateBadge" hidden><button id="btnUpdate" class="small primary">Update available</button></div>
-    <label id="search" title="Filter by name or URL (Ctrl+F)">
-      <span data-icon="search"></span>
-      <input id="searchBox" type="text" placeholder="Search" spellcheck="false">
-    </label>
+    <div id="search" title="Filter by name or URL (Ctrl+F)">
+      <button id="searchToggle" class="ghost" title="Search (Ctrl+F)" aria-label="Search" aria-expanded="false" aria-controls="searchBox"><span data-icon="search"></span></button>
+      <input id="searchBox" type="text" aria-label="Filter downloads" placeholder="Search" spellcheck="false">
+    </div>
   </header>
 
   <div id="main">
@@ -50,8 +51,9 @@
         </table>
         <div id="emptyList" hidden>
           <div class="empty-icon" data-icon="down"></div>
-          <div class="empty-title">No downloads here yet</div>
-          <div class="hint">Click <b>Add URL</b>, paste a link with Ctrl+V, drop links or a .torrent here — or just copy a download link anywhere.</div>
+          <div class="empty-title" id="emptyTitle"></div>
+          <div class="hint" id="emptyHint"></div>
+          <button id="emptyAction" class="primary"></button>
         </div>
       </div>
       <div class="split-h" id="splitDetails"></div>
@@ -119,7 +121,7 @@
   <footer id="status">
     <span id="statusLeft" class="ell grow"></span>
     <span id="statusTorrent" class="muted" title="BitTorrent engine — DHT lets FluxDM find peers for magnet links without a tracker"></span>
-    <span class="muted">Global speed limit</span>
+    <span class="muted" id="limitLabel" title="Global speed limit">Speed limit</span>
     <div id="limitBox" class="speedbox" title="Pick a preset or type your own: 750, 750k, 2 MB/s, 2.5m… (plain numbers are KB/s, 0 = unlimited)">
       <input id="limitInput" type="text" spellcheck="false">
       <button id="limitDrop" title="Presets">▾</button>

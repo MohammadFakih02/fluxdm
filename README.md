@@ -56,8 +56,11 @@ current Windows 10. If it's missing, the setup installs it.
   chosen days. When a queue finishes, FluxDM can exit, sleep, hibernate, shut down or restart, with a
   60-second countdown you can cancel.
 - **Speed:** a global limit, per-queue and per-download limits, and a daily speed schedule.
+  Global and queue budgets share spare bandwidth fairly across download types;
+  videos reconnect for changes over 30%, at most once a minute.
 - **Catching downloads:**
   - Copying a download link opens the Add window.
+  - Incoming links merge into Add forms with matching options; different contexts stay separate. POST downloads stay in the browser.
   - Drag links, `.txt` lists or `.torrent` files onto the window.
   - The browser extension and bookmarklets send downloads to FluxDM. The Firefox build is signed by Mozilla,
     so Settings → Browser extension installs it in one click. Chrome, Edge, Brave, Opera and Vivaldi load it

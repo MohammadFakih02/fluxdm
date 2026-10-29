@@ -32,6 +32,9 @@ function applyTheme(theme) {
   else delete document.documentElement.dataset.theme;
 }
 
+// Registered before each page requests its initial settings, including hidden toast windows.
+if (T.event?.listen) listen("theme-changed", applyTheme);
+
 // ---------------------------------------------------------------- formatting (mirrors the Rust side)
 
 function fmtSize(b) {
@@ -160,7 +163,7 @@ const CATEGORY_ICON = { Compressed: "zip", Documents: "doc", Music: "music", Vid
 let openMenus = [];
 function closeMenus() { openMenus.forEach((m) => m.remove()); openMenus = []; }
 document.addEventListener("mousedown", (e) => { if (!e.target.closest(".menu")) closeMenus(); }, true);
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && openMenus.length) { closeMenus(); e.stopPropagation(); } }, true);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && openMenus.length) { closeMenus(); e.stopImmediatePropagation(); } }, true);
 window.addEventListener("blur", closeMenus);
 
 // items: [{label, key, click, disabled, checked, sub:[...], header}] or "-" for a separator
@@ -208,15 +211,32 @@ function showMenu(items, x, y, level = 0) {
 
 // ---------------------------------------------------------------- dialogs
 
-function modal({ title, body, buttons = [], wide = false, xwide = false, onClose, focus = false }) {
+const modals = [];
+let modalId = 0;
+
+function modal({ title, body, buttons = [], wide = false, xwide = false, onClose, focus = false, backdrop = true }) {
+  const previousFocus = document.activeElement;
   const back = el("div", { class: "modal-back" });
-  const box = el("div", { class: "modal" + (wide ? " wide" : "") + (xwide ? " xwide" : "") });
+  const titleId = `modal-title-${++modalId}`;
+  const box = el("div", { class: "modal" + (wide ? " wide" : "") + (xwide ? " xwide" : ""), role: "dialog", "aria-modal": "true", "aria-labelledby": titleId, tabindex: -1 });
   const bodyEl = el("div", { class: "body" });
   if (typeof body === "string") bodyEl.innerHTML = body; else if (body) bodyEl.append(body);
   const foot = el("footer");
-  const close = (v) => { back.remove(); document.removeEventListener("keydown", onKey, true); onClose && onClose(v); };
+  let primaryButton;
+  let closed = false;
+  const close = (v) => {
+    if (closed) return;
+    closed = true;
+    const top = modals.at(-1) === back;
+    modals.splice(modals.indexOf(back), 1);
+    back.remove();
+    document.removeEventListener("keydown", onKey);
+    if (top && previousFocus?.isConnected) previousFocus.focus();
+    onClose && onClose(v);
+  };
   for (const b of buttons) {
     const btn = el("button", { class: (b.primary ? "primary" : "") + (b.danger ? " danger" : "") + (b.left ? " left" : ""), text: b.label });
+    if (b.primary) primaryButton = btn;
     btn.addEventListener("click", async () => {
       if (b.click) {
         const r = await b.click(btn);
@@ -227,23 +247,43 @@ function modal({ title, body, buttons = [], wide = false, xwide = false, onClose
     foot.append(btn);
   }
   const onKey = (e) => {
+    if (modals.at(-1) !== back || e.defaultPrevented || e.cancelBubble) return;
+    if (e.key === "Tab") {
+      const controls = $$("button, input, textarea, select, a[href], [tabindex]", box)
+        .filter((c) => !c.disabled && c.tabIndex >= 0 && c.getClientRects().length);
+      const first = controls[0], last = controls.at(-1);
+      if (!first || !controls.includes(document.activeElement) || (e.shiftKey ? document.activeElement === first : document.activeElement === last)) {
+        e.preventDefault();
+        (e.shiftKey ? last || box : first || box).focus();
+      }
+      e.stopImmediatePropagation();
+      return;
+    }
+    if (e.key !== "Escape" && e.key !== "Enter") return;
+    e.stopImmediatePropagation();
     if (e.key === "Escape" && !openMenus.length) { e.preventDefault(); close(undefined); }
-    if (e.key === "Enter" && e.target.tagName !== "TEXTAREA" && e.target.tagName !== "BUTTON") {
-      const p = buttons.findIndex((b) => b.primary);
-      if (p >= 0) { e.preventDefault(); foot.children[p].click(); }
+    if (e.key === "Enter" && (!box.contains(e.target) || (e.target.tagName !== "TEXTAREA" && e.target.tagName !== "BUTTON"))) {
+      e.preventDefault();
+      if (primaryButton && !primaryButton.disabled) primaryButton.click();
     }
   };
-  document.addEventListener("keydown", onKey, true);
-  box.append(el("header", { text: title }), bodyEl, foot);
+  document.addEventListener("keydown", onKey);
+  box.append(el("header", {}, el("span", { id: titleId, text: title }),
+    el("button", { class: "ghost modal-close", "aria-label": "Close dialog", text: "×", onclick: () => close(undefined) })), bodyEl, foot);
   back.append(box);
   back.addEventListener("mousedown", (e) => { if (e.target === back) back.dataset.down = "1"; });
-  back.addEventListener("mouseup", (e) => { if (e.target === back && back.dataset.down) close(undefined); delete back.dataset.down; });
+  back.addEventListener("mouseup", (e) => {
+    if (modals.at(-1) === back && e.target === back && back.dataset.down && backdrop && !$("input, textarea, select, form, [contenteditable]", bodyEl)) close(undefined);
+    delete back.dataset.down;
+  });
   document.body.append(back);
+  modals.push(back);
   // Prompts put the cursor in their box; bigger dialogs focus their main button instead.
   setTimeout(() => {
+    if (closed || modals.at(-1) !== back) return;
     const f = focus && $("input, textarea, select", bodyEl);
     if (f) { f.focus(); f.select && f.select(); }
-    else { const p = $("button.primary", foot); if (p) p.focus({ focusVisible: false }); }
+    else { const p = $("button.primary", foot) || $("button", foot) || box; p.focus({ focusVisible: false }); }
   }, 30);
   return { back, box, body: bodyEl, close };
 }
@@ -252,7 +292,7 @@ function alertBox(title, text) {
   return new Promise((res) => modal({ title, body: el("p", { class: "selectable", style: { whiteSpace: "pre-wrap" }, text }), buttons: [{ label: "OK", primary: true }], onClose: res }));
 }
 
-function confirmBox(title, text, okLabel = "OK", danger = false) {
+function confirmBox(title, text, okLabel = "Confirm", danger = false) {
   return new Promise((res) =>
     modal({
       title, body: el("p", { style: { whiteSpace: "pre-wrap" }, text }),
@@ -262,7 +302,7 @@ function confirmBox(title, text, okLabel = "OK", danger = false) {
 }
 
 // Returns the text, or null when cancelled.
-function promptBox(title, label, value = "", { multiline = false, mono = false, hint = "", validate } = {}) {
+function promptBox(title, label, value = "", { multiline = false, mono = false, hint = "", validate, action = "Save" } = {}) {
   return new Promise((res) => {
     const input = multiline ? el("textarea", { rows: 6, class: mono ? "mono" : "" }) : el("input", { type: "text", class: mono ? "mono" : "" });
     input.value = value;
@@ -275,7 +315,7 @@ function promptBox(title, label, value = "", { multiline = false, mono = false, 
       buttons: [
         { label: "Cancel" },
         {
-          label: "OK", primary: true,
+          label: action, primary: true,
           click: async () => {
             const v = input.value;
             if (validate) {

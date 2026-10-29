@@ -43,7 +43,7 @@ pub struct AddRequest {
     pub queue: Option<String>,
 }
 
-static PENDING_ADD: Mutex<Option<AddRequest>> = Mutex::new(None);
+static PENDING_ADD: std::sync::LazyLock<Mutex<std::collections::HashMap<String, AddRequest>>> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 /// Our own last copy, so the clipboard watcher doesn't catch it.
 static LAST_CLIP: Mutex<String> = Mutex::new(String::new());
 static TRAY_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
@@ -65,6 +65,21 @@ const TORRENT_RULE: &str = "FluxDM torrent peers";
 
 // ------------------------------------------------------------------ windows
 
+fn window_theme(value: &str) -> Option<tauri::Theme> {
+    match value.to_ascii_lowercase().as_str() {
+        "light" => Some(tauri::Theme::Light),
+        "dark" => Some(tauri::Theme::Dark),
+        _ => None,
+    }
+}
+
+fn apply_window_theme(app: &AppHandle, value: &str) {
+    let theme = window_theme(value);
+    for window in app.webview_windows().values() {
+        let _ = window.set_theme(theme);
+    }
+}
+
 pub fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let was_hidden = !w.is_visible().unwrap_or(true);
@@ -73,34 +88,34 @@ pub fn show_main(app: &AppHandle) {
         let _ = w.set_focus();
         // WebView2 sometimes paints nothing (white/black) when a window created hidden is first shown.
         if was_hidden {
+            webview_guard::touch();
             webview_guard::repaint_nudge(&w);
         }
     }
 }
 
 pub fn show_add(app: &AppHandle, req: AddRequest) {
-    if let Some(w) = app.get_webview_window("add") {
-        if !req.urls.trim().is_empty() {
-            let _ = w.emit("add-append", &req);
+    let (label, created) = pending_add(req);
+    if !created {
+        if let Some(w) = app.get_webview_window(&label) {
+            let _ = w.emit("add-links", ());
+            let _ = w.show();
+            let _ = w.unminimize();
+            let _ = w.set_focus();
         }
-        let _ = w.show();
-        let _ = w.set_focus();
         return;
     }
-    *PENDING_ADD.lock() = Some(req);
     // Triggered from the browser/clipboard while another app has focus: Windows won't let us steal focus,
     // so the dialog shows above everything instead of hidden behind the browser.
     let main_focused = app.get_webview_window("main").map(|w| w.is_visible().unwrap_or(false) && w.is_focused().unwrap_or(false)).unwrap_or(false);
     // Windows are built from an async task: building one on the event-loop thread can deadlock WebView2.
     let h = app.clone();
     tauri::async_runtime::spawn(async move {
-        if h.get_webview_window("add").is_some() {
-            return;
-        }
         // A new webview is white until its page paints — start dark when the system is dark.
         let dark = h.get_webview_window("main").and_then(|w| w.theme().ok()) == Some(tauri::Theme::Dark);
         let bg = if dark { tauri::window::Color(0x21, 0x22, 0x27, 255) } else { tauri::window::Color(255, 255, 255, 255) };
-        let b = WebviewWindowBuilder::new(&h, "add", WebviewUrl::App("add.html".into()))
+        let b = WebviewWindowBuilder::new(&h, &label, WebviewUrl::App("add.html".into()))
+            .theme(window_theme(&h.state::<Arc<Manager>>().settings().theme))
             .background_color(bg)
             .title("Add download — FluxDM")
             .inner_size(660.0, 640.0)
@@ -109,9 +124,80 @@ pub fn show_add(app: &AppHandle, req: AddRequest) {
             .always_on_top(!main_focused)
             .disable_drag_drop_handler();
         if let Ok(w) = b.build() {
+            let _ = w.set_theme(window_theme(&h.state::<Arc<Manager>>().settings().theme));
+            let key = label.clone();
+            w.on_window_event(move |event| {
+                if matches!(event, WindowEvent::Destroyed) { PENDING_ADD.lock().remove(&key); }
+            });
             let _ = w.set_focus();
+        } else {
+            PENDING_ADD.lock().remove(&label);
         }
     });
+}
+
+fn pending_add(req: AddRequest) -> (String, bool) {
+    let mut pending = PENDING_ADD.lock();
+    if req.name.is_none() {
+        if let Some((label, existing)) = pending.iter_mut().find(|(_, old)| {
+            old.name.is_none() && old.headers == req.headers && old.video == req.video && old.queue == req.queue
+        }) {
+            if !existing.urls.is_empty() && !req.urls.is_empty() { existing.urls.push('\n'); }
+            existing.urls.push_str(&req.urls);
+            return (label.clone(), false);
+        }
+    }
+    let label = format!("add-{}", uuid::Uuid::new_v4());
+    pending.insert(label.clone(), req);
+    (label, true)
+}
+
+#[test]
+fn incoming_add_forms_keep_each_requests_context() {
+    let (first, _) = pending_add(AddRequest { urls: "https://example.invalid/one".into(), headers: "Cookie: first\nReferer: https://example.invalid/page".into(), name: Some("first.zip".into()), ..Default::default() });
+    let (second, _) = pending_add(AddRequest { urls: "https://example.invalid/two".into(), headers: "Authorization: second".into(), video: true, queue: Some("video".into()), ..Default::default() });
+    assert_ne!(first, second);
+    let a = PENDING_ADD.lock().remove(&first).unwrap();
+    let b = PENDING_ADD.lock().remove(&second).unwrap();
+    assert_eq!(a.name.as_deref(), Some("first.zip"));
+    assert!(a.headers.contains("Cookie: first"));
+    assert!(a.headers.contains("Referer:"));
+    assert!(!a.video);
+    assert_eq!(b.urls, "https://example.invalid/two");
+    assert_eq!(b.headers, "Authorization: second");
+    assert!(b.video);
+    assert_eq!(b.queue.as_deref(), Some("video"));
+}
+
+#[test]
+fn incoming_add_forms_merge_only_matching_contexts_before_and_after_init() {
+    let req = AddRequest { urls: "https://example.invalid/one".into(), headers: "Cookie: merge-test".into(), video: true, queue: Some("merge-test".into()), ..Default::default() };
+    let (first, created) = pending_add(req.clone());
+    assert!(created);
+    let mut next = req.clone();
+    next.urls = "https://example.invalid/two".into();
+    assert_eq!(pending_add(next.clone()), (first.clone(), false));
+    {
+        let mut pending = PENDING_ADD.lock();
+        let form = pending.get_mut(&first).unwrap();
+        assert_eq!(form.urls, "https://example.invalid/one\nhttps://example.invalid/two");
+        // Loading consumes links but retains the context for later arrivals.
+        form.urls.clear();
+    }
+    assert_eq!(pending_add(next), (first.clone(), false));
+    assert_eq!(PENDING_ADD.lock()[&first].urls, "https://example.invalid/two");
+    for differing in [
+        AddRequest { headers: "Cookie: different".into(), ..req.clone() },
+        AddRequest { name: Some("forced.zip".into()), ..req.clone() },
+        AddRequest { video: false, ..req.clone() },
+        AddRequest { queue: Some("different".into()), ..req.clone() },
+    ] {
+        let (label, created) = pending_add(differing);
+        assert!(created);
+        assert_ne!(label, first);
+        PENDING_ADD.lock().remove(&label);
+    }
+    PENDING_ADD.lock().remove(&first);
 }
 
 fn toast_window(app: &AppHandle) {
@@ -119,6 +205,7 @@ fn toast_window(app: &AppHandle) {
         return;
     }
     let _ = WebviewWindowBuilder::new(app, "toast", WebviewUrl::App("toast.html".into()))
+        .theme(window_theme(&app.state::<Arc<Manager>>().settings().theme))
         .title("FluxDM")
         .inner_size(360.0, 104.0)
         .decorations(false)
@@ -644,7 +731,7 @@ fn free_space(folder: String) -> Option<i64> {
 }
 
 #[tauri::command]
-fn run_post_action(app: AppHandle, action: String) {
+fn run_post_action(app: AppHandle, action: String, force: bool) {
     let a = match action.as_str() {
         "Exit" => {
             let h = app.clone();
@@ -658,7 +745,6 @@ fn run_post_action(app: AppHandle, action: String) {
         _ => return,
     };
     let mgr = app.state::<Arc<Manager>>();
-    let force = mgr.st.lock().queues.iter().any(|q| q.post_action == a && q.force_shutdown);
     mgr.save();
     win::run_post_action(a, force);
 }
@@ -719,8 +805,12 @@ fn dropped_torrent(app: AppHandle, bytes: Vec<u8>) -> R<()> {
 // ------------------------------------------------------------------ commands: add window
 
 #[tauri::command]
-fn add_init(mgr: M) -> Value {
-    let req = PENDING_ADD.lock().take().unwrap_or_default();
+fn add_init(window: tauri::WebviewWindow, mgr: M) -> Value {
+    let req = PENDING_ADD.lock().get_mut(window.label()).map(|r| {
+        let req = r.clone();
+        r.urls.clear();
+        req
+    }).unwrap_or_default();
     let s = mgr.settings();
     let queues: Vec<String> = mgr.st.lock().queues.iter().map(|q| q.name.clone()).collect();
     json!({
@@ -734,6 +824,11 @@ fn add_init(mgr: M) -> Value {
         "formats": video::FORMATS.iter().map(|(k, l)| json!({ "key": k, "label": l })).collect::<Vec<_>>(),
         "ytInstalled": video::is_installed(),
     })
+}
+
+#[tauri::command]
+fn add_take_links(window: tauri::WebviewWindow) -> String {
+    PENDING_ADD.lock().get_mut(window.label()).map(|r| std::mem::take(&mut r.urls)).unwrap_or_default()
 }
 
 #[tauri::command]
@@ -774,9 +869,9 @@ async fn video_probe(mgr: M<'_>, url: String) -> R<Value> {
 }
 
 #[tauri::command]
-async fn torrent_info(mgr: M<'_>, source: String) -> R<Value> {
+async fn torrent_info(mgr: M<'_>, source: String, headers: Option<String>) -> R<Value> {
     let m = mgr.inner().clone();
-    let r = tokio::time::timeout(Duration::from_secs(90), async { m.torrents.info(&m, &source).await }).await;
+    let r = tokio::time::timeout(Duration::from_secs(90), async { m.torrents.info(&m, &source, headers.as_deref().unwrap_or("")).await }).await;
     match r {
         Ok(v) => {
             let mut v = v.map_err(|e| e.msg)?;
@@ -826,7 +921,7 @@ struct AddSubmit {
 }
 
 #[tauri::command]
-fn add_submit(app: AppHandle, mgr: M, req: AddSubmit) -> R<()> {
+fn add_submit(window: tauri::WebviewWindow, mgr: M, req: AddSubmit) -> R<()> {
     if req.urls.is_empty() {
         return Err("Paste at least one link.".into());
     }
@@ -901,11 +996,10 @@ fn add_submit(app: AppHandle, mgr: M, req: AddSubmit) -> R<()> {
     }
     for it in &mut items {
         it.open_when_done = req.open_when_done;
+        it.headers = req.headers.trim().to_string();
     }
     mgr.inner().add(items, req.start);
-    if let Some(w) = app.get_webview_window("add") {
-        let _ = w.close();
-    }
+    let _ = window.close();
     Ok(())
 }
 
@@ -991,6 +1085,7 @@ async fn torrent_move(mgr: M<'_>, ids: Vec<String>, folder: String, restart_if_u
             return Err(format!("“{}” isn't finished, and moving it to another drive would copy its whole placeholder files. Choose “start over there” instead.", it.file_name));
         }
         let resume = m.is_running(&id);
+        torrent::check_move_destination(&it, &folder).map_err(|e| e.msg)?;
         m.pause(&id).await;
         m.with_item(&id, |it| it.note = if fresh { "clearing old partial files…".into() } else { "moving files…".into() });
         let r = if fresh {
@@ -1012,9 +1107,9 @@ async fn torrent_move(mgr: M<'_>, ids: Vec<String>, folder: String, restart_if_u
         if resume {
             m.start(&id);
         }
+        m.save();
         r.map_err(|e| format!("Couldn't move “{}”: {}", it.file_name, e.msg))?;
     }
-    m.save();
     Ok(())
 }
 
@@ -1170,7 +1265,7 @@ fn queue_save(mgr: M, old_name: String, def: Value) -> R<()> {
         let Some(q) = st.queues.iter_mut().find(|q| q.name == name) else { return Err("That queue no longer exists.".into()) };
         parsed.name = name.clone();
         parsed.running = q.running;
-        parsed.started_any = q.started_any;
+        parsed.started_ids = q.started_ids.clone();
         parsed.last_start_fire = q.last_start_fire;
         parsed.last_stop_fire = q.last_stop_fire;
         parsed.max_concurrent = parsed.max_concurrent.clamp(1, 20);
@@ -1303,6 +1398,8 @@ async fn save_settings(app: AppHandle, mgr: M<'_>, settings: Settings) -> R<()> 
     if old.show_icons != new.show_icons || old.lookup_covers_online != new.lookup_covers_online {
         covers::refresh_all(&m);
     }
+    apply_window_theme(&app, &new.theme);
+    let _ = app.emit("theme-changed", &new.theme);
     let _ = app.emit("settings-changed", json!({}));
     m.push_list();
     Ok(())
@@ -1515,8 +1612,8 @@ fn bookmarklets(mgr: M, port: Option<i32>) -> Value {
 }
 
 #[tauri::command]
-async fn check_update(mgr: M<'_>) -> R<Option<update::Release>> {
-    update::check(&mgr.settings().update_repo).await
+async fn check_update(mgr: M<'_>, repo: Option<String>) -> R<Option<update::Release>> {
+    update::check(&repo.unwrap_or_else(|| mgr.settings().update_repo)).await
 }
 
 #[tauri::command]
@@ -1528,15 +1625,21 @@ async fn install_update(app: AppHandle, release: update::Release) -> R<()> {
     .await?;
     // Close everything cleanly, then hand over to the new version.
     let mgr = app.state::<Arc<Manager>>().inner().clone();
+    let resume = mgr.update_resume();
+    store::write("update-resume.json", &resume).map_err(|e| format!("Couldn't save downloads to resume after the update: {e}"))?;
     mgr.exiting.store(true, Ordering::SeqCst);
-    let _ = tokio::time::timeout(Duration::from_secs(5), mgr.pause_all()).await;
-    let _ = tokio::time::timeout(Duration::from_secs(4), mgr.torrents.shutdown()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), mgr.pause_all()).await;
     mgr.save();
+    // The new copy waits for this process to be gone (see main), or it would hand itself over to us and quit.
+    if let Err(e) = std::process::Command::new(exe).arg(format!("--updated={}", std::process::id())).spawn() {
+        let _ = std::fs::remove_file(store::path("update-resume.json"));
+        mgr.exiting.store(false, Ordering::SeqCst);
+        mgr.resume_after_update(&resume);
+        return Err(format!("Couldn't start the updated version: {e}. Your downloads have been resumed."));
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(4), mgr.torrents.shutdown()).await;
     api::stop_local();
     api::stop_remote();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    // The new copy waits for this process to be gone (see main), or it would hand itself over to us and quit.
-    let _ = std::process::Command::new(exe).arg(format!("--updated={}", std::process::id())).spawn();
     app.exit(0);
     Ok(())
 }
@@ -1547,6 +1650,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let wants_exit = args.iter().any(|a| a.eq_ignore_ascii_case("--exit"));
     let tray_only = args.iter().any(|a| a == "--tray");
+    let updated = args.iter().any(|a| a == "--updated" || a.starts_with("--updated="));
     let first_url = args.iter().skip(1).find(|a| net::is_download_source(a)).cloned();
     // Started by the updater: the old copy may still be closing. While its single-instance window exists, this
     // copy would pass its arguments to it and quit, leaving no FluxDM running at all.
@@ -1603,7 +1707,8 @@ fn main() {
                 handle.exit(0);
                 return Ok(());
             }
-            mgr.load();
+            mgr.load(updated);
+            apply_window_theme(&handle, &mgr.settings().theme);
             {
                 let h = handle.clone();
                 mgr.set_ui(Box::new(move |event, payload| match event {
@@ -1697,6 +1802,7 @@ fn main() {
                 restore_geometry(&w, &mgr.settings());
                 if !tray_only {
                     let _ = w.show();
+                    webview_guard::touch();
                     webview_guard::repaint_nudge(&w);
                 }
                 webview_guard::spawn_watchdog(handle.clone(), "main");
@@ -1741,7 +1847,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             init, ready, start, pause, toggle, pause_all, remove, restart, clear_finished, set_items, add_mirrors, probe, refresh_link,
             details, open_item, show_item, copy_text, clipboard_url, sha256, set_global_limit, parse_speed, free_space, run_post_action,
-            exit, toast_click, toast_hide, toast_ready, toast_show, open_add, dropped_torrent, add_init, classify, folder_for, video_probe, torrent_info, add_submit,
+            exit, toast_click, toast_hide, toast_ready, toast_show, open_add, dropped_torrent, add_init, add_take_links, classify, folder_for, video_probe, torrent_info, add_submit,
             webview_guard::ui_heartbeat, torrent_recheck, torrent_reannounce, torrent_move, torrent_add_trackers, torrent_copy, torrent_export, torrent_file, torrent_file_priority, icon_find, icon_choose,
             icon_mode, clean_title, queues, queue_save, queue_new, queue_delete, queue_run, queue_move, get_settings, save_settings,
             save_layout, new_pin, stats, reset_stats, yt_version, yt_update, firewall_status, firewall_allow, magnet_toggle,

@@ -51,11 +51,10 @@
       <div data-notorrent class="row"><input id="conn" type="range" min="1" max="64" class="grow"><b id="connVal" style="width:26px;text-align:right"></b></div>
       <span data-notorrent>Speed limit</span>
       <span data-torrentonly>Download limit</span>
-      <div class="row">
+      <div class="speed-queue">
         <span id="limitBox" class="speedbox" title="Pick a preset or type your own: 750k, 2 MB/s… (plain numbers are KB/s, 0 = unlimited)"><input id="limit" type="text"><button title="Presets">▾</button></span>
-        <span class="grow"></span>
-        <span class="muted">Queue</span>
-        <select id="queue" style="min-width:170px"></select>
+        <label class="muted" for="queue">Queue</label>
+        <select id="queue"></select>
       </div>
       <span data-torrentonly>Upload limit</span>
       <div data-torrentonly class="row wrap">

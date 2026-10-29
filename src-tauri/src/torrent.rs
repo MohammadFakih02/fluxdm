@@ -24,12 +24,14 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Lowest limit handed to the engine. Its patched limiter passes 16 KB blocks at any rate (vendor/PATCHES.md);
-/// this only keeps a typo like "1" (1 KB/s) from leaving peers waiting many seconds per block.
-const MIN_RATE: i64 = 4 * 1024;
 /// "No upload": the patched engine reads an upload limit of 1 B/s as "answer no requests" (vendor/PATCHES.md).
-/// Going through `rate()` would have raised it to MIN_RATE, i.e. 32 KB/s of upload.
 const NO_UPLOAD: Option<NonZeroU32> = NonZeroU32::new(1);
+
+struct CachedMeta {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    meta: Arc<Meta>,
+}
 
 #[derive(Default)]
 pub struct Service {
@@ -41,6 +43,7 @@ pub struct Service {
     peer_limit: Mutex<usize>,
     /// "hash|addr" -> (when, fetched, uploaded, down B/s, up B/s), for per-peer speeds in the Peers tab.
     peer_rates: Mutex<HashMap<String, (Instant, u64, u64, f64, f64)>>,
+    metadata: Mutex<HashMap<String, CachedMeta>>,
 }
 
 /// File priority levels as the item stores them (0 = don't download). Higher downloads first.
@@ -105,7 +108,7 @@ fn rate(kbps_bytes: i64) -> Option<NonZeroU32> {
     if kbps_bytes <= 0 {
         return None;
     }
-    NonZeroU32::new(kbps_bytes.max(MIN_RATE).min(u32::MAX as i64) as u32)
+    NonZeroU32::new(kbps_bytes.min(u32::MAX as i64) as u32)
 }
 
 fn anyhow_err(e: anyhow::Error) -> DlError {
@@ -157,6 +160,14 @@ pub fn parse(bytes: &[u8]) -> DlResult<Meta> {
     }
     let size = files.iter().map(|f| f.1).sum();
     Ok(Meta { name, multi, files, padding, hash: t.info_hash.as_string(), trackers, tiers, size })
+}
+
+pub fn source_hash(source: &str) -> Option<String> {
+    if net::is_magnet(source) {
+        librqbit::Magnet::parse(source).ok()?.as_id20().map(|h| h.as_string())
+    } else {
+        parse(&std::fs::read(source.trim().trim_matches('"')).ok()?).ok().map(|m| m.hash)
+    }
 }
 
 /// Where a torrent's files go: a multi-file torrent gets its own folder (like qBittorrent/MonoTorrent did).
@@ -245,7 +256,7 @@ impl Service {
 
     /// The .torrent bytes for a magnet link (asks peers via DHT/trackers), a .torrent web link or file,
     /// cached as a .torrent file in the data folder.
-    pub async fn resolve(&self, mgr: &Arc<Manager>, source: &str, status: impl Fn(&str)) -> DlResult<(Vec<u8>, String)> {
+    pub async fn resolve(&self, mgr: &Arc<Manager>, source: &str, headers: &str, status: impl Fn(&str)) -> DlResult<(Vec<u8>, String)> {
         let source = source.trim().trim_matches('"');
         std::fs::create_dir_all(dir())?;
         let bytes = if net::is_magnet(source) {
@@ -272,7 +283,7 @@ impl Service {
             status("downloading the .torrent file…");
             let ua = mgr.settings().user_agent;
             let fut = async {
-                let resp = net::build(source, "", &ua, None, reqwest::Method::GET).send().await?;
+                let resp = net::get_scoped(source, headers, &ua).await?;
                 net::ensure_ok(&resp)?;
                 Ok::<_, DlError>(resp.bytes().await?.to_vec())
             };
@@ -291,8 +302,8 @@ impl Service {
     }
 
     /// What the Add window shows about a torrent.
-    pub async fn info(&self, mgr: &Arc<Manager>, source: &str) -> DlResult<Value> {
-        let (bytes, cached) = self.resolve(mgr, source, |_| {}).await?;
+    pub async fn info(&self, mgr: &Arc<Manager>, source: &str, headers: &str) -> DlResult<Value> {
+        let (bytes, cached) = self.resolve(mgr, source, headers, |_| {}).await?;
         let m = parse(&bytes)?;
         Ok(json!({
             "name": m.name,
@@ -306,10 +317,11 @@ impl Service {
     // ------------------------------------------------------------------ adding / removing
 
     #[allow(clippy::too_many_arguments)]
-    async fn add(&self, session: &Arc<Session>, bytes: Vec<u8>, meta: &Meta, output: &str, it: &Item, down_bps: i64, paused: bool) -> DlResult<ManagedTorrentHandle> {
+    async fn add(&self, mgr: &Arc<Manager>, session: &Arc<Session>, bytes: Vec<u8>, meta: &Meta, output: &str, it: &Item, down_bps: i64, paused: bool) -> DlResult<ManagedTorrentHandle> {
+        if !mgr.claim_torrent_hash(&it.id, &meta.hash) { return Err(DlError::cancelled()); }
         let skipped: HashSet<i32> = it.skipped_files.iter().copied().collect();
         let only: Vec<usize> = (0..meta.files.len()).filter(|i| !skipped.contains(&(*i as i32))).collect();
-        let up = up_limit_bps(it.upload_limit_kbps);
+        let up = self.upload_limit(mgr, it);
         if let Some(h) = self.find(&meta.hash) {
             // Already in the engine: change its limits in place (re-adding would re-verify the data).
             h.set_ratelimits(LimitsConfig { download_bps: rate(down_bps), upload_bps: up });
@@ -343,6 +355,7 @@ impl Service {
 
     /// Takes a torrent out of the engine. Unfinished downloads also lose their partial data.
     pub async fn remove(&self, mgr: &Arc<Manager>, it: &Item, delete_data: bool) {
+        self.metadata.lock().remove(&it.torrent_file);
         let _ = mgr;
         if let (Some(s), Some(h)) = (self.session_now(), self.find(&it.info_hash)) {
             let _ = s.delete(TorrentIdOrHash::Hash(h.info_hash()), delete_data).await;
@@ -401,9 +414,10 @@ impl Service {
             let session = self.session(mgr).await?;
             let h = match self.find(&meta.hash) {
                 Some(h) => h,
-                None => self.add(&session, bytes, &meta, &folder, &it, 0, false).await?,
+                None => self.add(mgr, &session, bytes, &meta, &folder, &it, 0, false).await?,
             };
             if h.is_paused() {
+                h.set_ratelimits(LimitsConfig { download_bps: None, upload_bps: self.upload_limit(mgr, &it) });
                 session.unpause(&h).await.map_err(anyhow_err)?;
             }
             Ok(())
@@ -422,7 +436,7 @@ impl Service {
                 let _ = s.pause(&h).await;
             }
         }
-        mgr.with_item(id, |it| it.note.clear());
+        mgr.with_item(id, |it| { it.note.clear(); it.seeding = false; it.upload_speed = 0.0; it.connected_peers = 0; });
     }
 
     /// Re-reads every piece already on disk and keeps only what verifies ("Force recheck"). The caller pauses
@@ -435,7 +449,7 @@ impl Service {
         if let Some(h) = self.find(&meta.hash) {
             let _ = session.delete(TorrentIdOrHash::Hash(h.info_hash()), false).await;
         }
-        let h = self.add(&session, bytes, &meta, &output_folder(&it, &meta), &it, 0, true).await?;
+        let h = self.add(mgr, &session, bytes, &meta, &output_folder(&it, &meta), &it, 0, true).await?;
         loop {
             let st = h.stats();
             if matches!(st.state, librqbit::TorrentStatsState::Paused | librqbit::TorrentStatsState::Live | librqbit::TorrentStatsState::Error) {
@@ -451,33 +465,12 @@ impl Service {
     /// Moves the downloaded data (finished or not) to another folder. The caller pauses the item first.
     pub async fn move_data(&self, mgr: &Arc<Manager>, id: &str, new_folder: &str) -> DlResult<()> {
         let it = mgr.item(id).ok_or_else(|| DlError::fatal("gone"))?;
+        let paths = move_targets(&it, new_folder);
+        check_move_targets(&paths)?;
         if let (Some(s), Some(h)) = (self.session_now(), self.find(&it.info_hash)) {
             let _ = s.delete(TorrentIdOrHash::Hash(h.info_hash()), false).await;
         }
-        std::fs::create_dir_all(new_folder)?;
-        let bytes = std::fs::read(&it.torrent_file).ok();
-        let meta = bytes.as_deref().and_then(|b| parse(b).ok());
-        match meta {
-            Some(m) if m.multi => {
-                let from = output_folder(&it, &m);
-                let to = Path::new(new_folder).join(net::sanitize(&m.name));
-                move_path(Path::new(&from), &to)?;
-            }
-            Some(m) => {
-                for (p, _) in &m.files {
-                    let from = Path::new(&it.save_folder).join(p);
-                    if from.exists() {
-                        move_path(&from, &Path::new(new_folder).join(p))?;
-                    }
-                }
-            }
-            None => {
-                let from = PathBuf::from(it.full_path());
-                if from.exists() {
-                    move_path(&from, &Path::new(new_folder).join(&it.file_name))?;
-                }
-            }
-        }
+        move_paths(&paths)?;
         Ok(())
     }
 
@@ -500,7 +493,7 @@ impl Service {
 
     /// Live details for the Trackers / Peers / Content tabs.
     pub fn details(&self, it: &Item) -> Value {
-        let meta = std::fs::read(&it.torrent_file).ok().and_then(|b| parse(&b).ok());
+        let meta = self.cached_meta(&it.torrent_file);
         let h = self.find(&it.info_hash);
         let stats = h.as_ref().map(|h| h.stats());
         let skipped: HashSet<i32> = it.skipped_files.iter().copied().collect();
@@ -700,28 +693,49 @@ impl Service {
 
     // ------------------------------------------------------------------ heartbeat (every second)
 
+    fn cached_meta(&self, path: &str) -> Option<Arc<Meta>> {
+        let file = std::fs::metadata(path).ok()?;
+        let stamp = (file.len(), file.modified().ok());
+        let mut cache = self.metadata.lock();
+        if let Some(entry) = cache.get(path) {
+            if (entry.len, entry.modified) == stamp { return Some(entry.meta.clone()); }
+        }
+        let meta = Arc::new(parse(&std::fs::read(path).ok()?).ok()?);
+        cache.insert(path.to_string(), CachedMeta { len: stamp.0, modified: stamp.1, meta: meta.clone() });
+        Some(meta)
+    }
+
+    fn upload_limit(&self, mgr: &Manager, it: &Item) -> Option<NonZeroU32> {
+        let st = mgr.st.lock();
+        let finished = it.status == DlStatus::Completed;
+        let count = st.items.iter().filter(|i| i.is_torrent && (i.status == DlStatus::Completed) == finished
+            && (i.id == it.id || self.find(&i.info_hash).is_some_and(|h| !h.is_paused()))).count();
+        let (own, global) = if finished { (it.seeding_limit_kbps, st.settings.torrent_seeding_limit_kbps) }
+            else { (it.upload_limit_kbps, st.settings.torrent_upload_limit_kbps) };
+        class_upload_limit(own, global, count)
+    }
+
     pub async fn tick(&self, mgr: &Arc<Manager>) {
         let Some(session) = self.session_now() else { return };
         let s = mgr.settings();
-        session.ratelimits.set_download_bps(rate(Manager::effective_global_kbps(&s) as i64 * 1024));
+        session.ratelimits.set_download_bps(None);
+        session.ratelimits.set_upload_bps(None);
         let items: Vec<Item> = mgr.st.lock().items.iter().filter(|i| i.is_torrent && !i.info_hash.is_empty()).cloned().collect();
-        let downloading = items.iter().any(|i| i.is_torrent && i.status == DlStatus::Downloading);
-        let up = if downloading { s.torrent_upload_limit_kbps } else { s.torrent_seeding_limit_kbps };
-        session.ratelimits.set_upload_bps(if up < 0 { NO_UPLOAD } else { rate(up as i64 * 1024) });
 
-        // Per-torrent limits apply live; the session-wide ones above stack on top.
+        // Each torrent uses its download share and the upload budget for its own phase.
         for it in &items {
             let Some(h) = self.find(&it.info_hash) else { continue };
             let finished = it.status == DlStatus::Completed;
             h.set_sequential(it.sequential);
             h.set_ratelimits(LimitsConfig {
                 download_bps: if finished { None } else { rate(own_down_limit(mgr, it)) },
-                upload_bps: up_limit_bps(if finished { it.seeding_limit_kbps } else { it.upload_limit_kbps }),
+                upload_bps: self.upload_limit(mgr, it),
             });
         }
 
         let mut seeding = HashSet::new();
         for it in items.iter().filter(|i| i.status == DlStatus::Completed && !mgr.is_running(&i.id)) {
+            mgr.with_item(&it.id, |x| { x.seeding = false; x.upload_speed = 0.0; x.connected_peers = 0; });
             let Some(h) = self.find(&it.info_hash) else { continue };
             if h.is_paused() {
                 continue;
@@ -771,6 +785,8 @@ impl Service {
                 });
             } else {
                 mgr.with_item(&it.id, |x| {
+                    x.seeding = true;
+                    x.upload_speed = now.live.as_ref().map(|l| l.upload_speed.mbps * 1048576.0).unwrap_or(0.0);
                     x.connected_peers = peers as i32;
                     x.note = format!("seeding · ratio {ratio:.2} of {target} · {peers} peers");
                 });
@@ -808,24 +824,95 @@ pub fn same_drive(a: &str, b: &str) -> bool {
     root(a) == root(b)
 }
 
-fn move_path(from: &Path, to: &Path) -> std::io::Result<()> {
-    if let Some(parent) = to.parent() {
-        std::fs::create_dir_all(parent)?;
+fn move_targets(it: &Item, folder: &str) -> Vec<(PathBuf, PathBuf)> {
+    let meta = std::fs::read(&it.torrent_file).ok().and_then(|b| parse(&b).ok());
+    match meta {
+        Some(m) if m.multi => vec![(PathBuf::from(output_folder(it, &m)), Path::new(folder).join(net::sanitize(&m.name)))],
+        Some(m) => m.files.iter().map(|(p, _)| (Path::new(&it.save_folder).join(p), Path::new(folder).join(p))).collect(),
+        None => vec![(PathBuf::from(it.full_path()), Path::new(folder).join(&it.file_name))],
     }
-    if std::fs::rename(from, to).is_ok() {
-        return Ok(());
-    }
-    // Different drive: copy, then delete.
-    if from.is_dir() {
-        std::fs::create_dir_all(to)?;
-        for e in std::fs::read_dir(from)?.flatten() {
-            move_path(&e.path(), &to.join(e.file_name()))?;
+}
+
+pub fn check_move_destination(it: &Item, folder: &str) -> DlResult<()> {
+    check_move_targets(&move_targets(it, folder)).map_err(DlError::from)
+}
+
+fn check_move_targets(paths: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
+    for (_, to) in paths {
+        if to.try_exists()? {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("The destination already contains “{}”. Choose another folder or move that file first.", to.file_name().unwrap_or_default().to_string_lossy())));
         }
-        std::fs::remove_dir(from)
-    } else {
-        std::fs::copy(from, to)?;
-        std::fs::remove_file(from)
     }
+    Ok(())
+}
+
+fn copy_path(from: &Path, to: &Path, created: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir(to)?;
+        created.push(to.to_path_buf());
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_path(&entry.path(), &to.join(entry.file_name()), created)?;
+        }
+    } else {
+        let mut source = std::fs::File::open(from)?;
+        let mut dest = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+        created.push(to.to_path_buf());
+        std::io::copy(&mut source, &mut dest)?;
+        dest.sync_all()?;
+    }
+    Ok(())
+}
+
+fn move_paths(paths: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
+    check_move_targets(paths)?;
+    let existing: Vec<_> = paths.iter().filter(|(from, _)| from.exists()).cloned().collect();
+    let paths = existing.as_slice();
+    // A single rename is atomic. Multiple paths use the same copy transaction as a cross-drive move.
+    if let [(from, to)] = paths {
+        if !from.exists() { return Ok(()); }
+        if let Some(parent) = to.parent() { std::fs::create_dir_all(parent)?; }
+        if rename_new(from, to).is_ok() { return Ok(()); }
+    }
+    copy_paths(paths)?;
+    for (from, _) in paths.iter().filter(|(from, _)| from.exists()) {
+        let result = if from.is_dir() { std::fs::remove_dir_all(from) } else { std::fs::remove_file(from) };
+        // The complete copy is now the usable location, even if Windows keeps an original file open.
+        if let Err(e) = result { crate::util::log_error(&format!("Files moved, but an original could not be removed: {e}")); }
+    }
+    Ok(())
+}
+
+fn copy_paths(paths: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
+    let mut created = vec![];
+    let result = (|| {
+        for (from, to) in paths {
+            if let Some(parent) = to.parent() { std::fs::create_dir_all(parent)?; }
+            copy_path(from, to, &mut created)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        for path in created.iter().rev() {
+            let _ = if path.is_dir() { std::fs::remove_dir(path) } else { std::fs::remove_file(path) };
+        }
+    }
+    result
+}
+
+#[cfg(windows)]
+fn rename_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVE_FILE_FLAGS(0)) }.map_err(std::io::Error::other)
+}
+
+#[cfg(not(windows))]
+fn rename_new(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other("Copy required"))
 }
 
 // ------------------------------------------------------------------ runner
@@ -874,24 +961,15 @@ pub async fn run(mgr: Arc<Manager>, run: Arc<Run>) {
     }
 }
 
-/// The tighter of the queue's and the item's own download limit, in bytes/s (0 = none).
+/// The manager re-splits this share whenever the running set changes.
 fn own_down_limit(mgr: &Arc<Manager>, it: &Item) -> i64 {
-    let mut best = 0i64;
-    for v in [mgr.queue_limiter(&it.queue_name).map(|l| l.get()).unwrap_or(0), it.speed_limit_kbps as i64 * 1024] {
-        if v > 0 && (best == 0 || v < best) {
-            best = v;
-        }
-    }
-    best
+    mgr.run_of(&it.id).map(|r| r.limiter.get()).unwrap_or(0)
 }
 
-/// A per-item upload limit in KB/s (0 = none, negative = no upload at all) as bytes/s.
-fn up_limit_bps(kbps: i32) -> Option<NonZeroU32> {
-    match kbps {
-        0 => None,
-        k if k < 0 => NO_UPLOAD,
-        k => rate(k as i64 * 1024),
-    }
+fn class_upload_limit(own: i32, global: i32, count: usize) -> Option<NonZeroU32> {
+    if own < 0 || global < 0 { return NO_UPLOAD; }
+    let share = if global > 0 { (global as i64 * 1024 / count.max(1) as i64).max(2) } else { 0 };
+    rate([own as i64 * 1024, share].into_iter().filter(|v| *v > 0).min().unwrap_or(0))
 }
 
 async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentHandle>) -> DlResult<()> {
@@ -909,10 +987,13 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentH
         mgr.with_item(&id, |it| it.error_message = s.to_string());
     };
     let (bytes, cached) = tokio::select! {
-        r = svc.resolve(mgr, &source, status) => r?,
+        r = svc.resolve(mgr, &source, &it.headers, status) => r?,
         _ = run.cancel.cancelled() => return Err(DlError::cancelled()),
     };
     let meta = parse(&bytes)?;
+    if !mgr.claim_torrent_hash(&id, &meta.hash) {
+        return Err(DlError::cancelled());
+    }
     let skipped: HashSet<i32> = it.skipped_files.iter().copied().collect();
     let wanted: i64 = meta.files.iter().enumerate().filter(|(i, _)| !skipped.contains(&(*i as i32))).map(|(_, f)| f.1 as i64).sum();
     mgr.with_item(&id, |it| {
@@ -933,11 +1014,11 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentH
         }
     }
 
-    // Queue and per-item limits are fixed per torrent (the global one applies live, session-wide).
+    // The current share also applies before the first heartbeat.
     let own = own_down_limit(mgr, &it);
     run.started_limit.store(own, Ordering::Relaxed);
     let session = svc.session(mgr).await?;
-    let h = svc.add(&session, bytes, &meta, &folder, &it, own, false).await?;
+    let h = svc.add(mgr, &session, bytes, &meta, &folder, &it, own, false).await?;
     if h.is_paused() {
         session.unpause(&h).await.map_err(anyhow_err)?;
     }
@@ -1038,4 +1119,83 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentH
         it.completed_at = Some(chrono::Local::now());
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_budgets_are_independent_for_downloading_and_seeding() {
+        assert_eq!(class_upload_limit(0, -1, 2), NO_UPLOAD);
+        assert_eq!(class_upload_limit(0, 20, 2).unwrap().get(), 10 * 1024);
+        assert_eq!(class_upload_limit(4, 20, 2).unwrap().get(), 4 * 1024);
+        assert_eq!(class_upload_limit(-1, 20, 2), NO_UPLOAD);
+        assert_eq!(class_upload_limit(0, 0, 2), None);
+        assert_eq!(class_upload_limit(0, 1, 2).unwrap().get(), 512);
+        let mgr = Manager::new();
+        let down = Item { is_torrent: true, status: DlStatus::Downloading, ..Default::default() };
+        let seed = Item { is_torrent: true, status: DlStatus::Completed, ..Default::default() };
+        {
+            let mut st = mgr.st.lock();
+            st.settings.torrent_upload_limit_kbps = -1;
+            st.settings.torrent_seeding_limit_kbps = 20;
+            st.items = vec![down.clone(), seed.clone()];
+        }
+        assert_eq!(mgr.torrents.upload_limit(&mgr, &down), NO_UPLOAD);
+        assert_eq!(mgr.torrents.upload_limit(&mgr, &seed).unwrap().get(), 20 * 1024);
+    }
+
+    #[test]
+    fn details_cache_reuses_metadata_and_invalidates_changed_files() {
+        let path = std::env::current_dir().unwrap().join("target").join(format!("meta-test-{}.torrent", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"d4:infod6:lengthi3e4:name4:test12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrstee").unwrap();
+        let svc = Service::default();
+        let key = path.to_str().unwrap();
+        let first = svc.cached_meta(key).unwrap();
+        let again = svc.cached_meta(key).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        std::fs::write(&path, b"d4:infod6:lengthi3e4:name9:test-file12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrstee").unwrap();
+        let changed = svc.cached_meta(key).unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed.name, "test-file");
+        std::fs::remove_file(&path).unwrap();
+        assert!(svc.cached_meta(key).is_none());
+    }
+
+    #[test]
+    fn magnet_hash_is_normalized_without_metadata() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(source_hash(&format!("magnet:?xt=urn:btih:{}", hash.to_uppercase())).as_deref(), Some(hash));
+    }
+
+    #[test]
+    fn move_conflicts_and_copy_failure_keep_originals() {
+        let root = std::env::current_dir().unwrap().join("target").join(format!("move-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a");
+        let b = root.join("b");
+        let x = root.join("x");
+        let y = root.join("y");
+        std::fs::write(&a, "first").unwrap();
+        std::fs::write(&b, "second").unwrap();
+        std::fs::write(&y, "existing").unwrap();
+        let paths = vec![(a.clone(), x.clone()), (b.clone(), y.clone())];
+        let e = move_paths(&paths).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(e.to_string().contains('y'));
+        assert!(!x.exists());
+        // Simulate a destination appearing between preflight and the second copy.
+        assert!(copy_paths(&paths).is_err());
+        assert!(!x.exists());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "second");
+        assert_eq!(std::fs::read_to_string(&y).unwrap(), "existing");
+        std::fs::remove_file(&y).unwrap();
+        move_paths(&paths).unwrap();
+        assert!(!a.exists() && !b.exists());
+        assert_eq!(std::fs::read_to_string(&x).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&y).unwrap(), "second");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

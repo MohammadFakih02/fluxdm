@@ -185,13 +185,14 @@ fn handle_extension_add(ctx: &Ctx, a: ExtensionAdd, from_ext: bool) -> bool {
         let s = mgr.settings();
         let mut items: Vec<Item> = vec![];
         for u in &urls {
-            let it = if net::is_torrent_source(u) {
+            let mut it = if net::is_torrent_source(u) {
                 mgr.create_torrent_item(u, None, None, None)
             } else if video {
                 mgr.create_video_item(u, None, &s.default_video_format, false, None)
             } else {
                 mgr.create_item(u, name.as_deref(), &h, &items)
             };
+            it.headers = h.clone();
             items.push(it);
         }
         let first = items[0].file_name.clone();
@@ -205,7 +206,7 @@ fn handle_extension_add(ctx: &Ctx, a: ExtensionAdd, from_ext: bool) -> bool {
             &ctx.app,
             crate::AddRequest {
                 urls: urls.join("\n"),
-                headers: if video { String::new() } else { h },
+                headers: h,
                 name: if video { None } else { name },
                 video,
                 ..Default::default()

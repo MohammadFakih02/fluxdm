@@ -62,15 +62,17 @@ const trs = new Map(); // id -> <tr>
     const g = await invoke("get_settings");
     S.settings = g.settings;
     applyTheme(S.settings.Theme);
+    drawSeg(); drawGraph();
     showLimit();
   });
   await listen("countdown", showCountdown);
+  await listen("torrent-duplicate", (p) => selectOnly(p.id));
   await listen("offer-firewall", offerFirewall);
   await listen("update-available", (rel) => { S.update = rel; $("#updateBadge").hidden = false; $("#btnUpdate").textContent = `Update to ${rel.version}`; });
   await listen("update-progress", (p) => { const b = $("#updProg"); if (b) b.style.width = p + "%"; });
   showLimit();
   await invoke("ready");
-  setInterval(refreshDetails, 1000);
+  setInterval(() => refreshDetails(true), 1000);
 })();
 
 // ---------------------------------------------------------------- list updates
@@ -211,6 +213,15 @@ function arrange() {
     prev = tr;
   }
   $("#emptyList").hidden = n > 0;
+  if (!n) {
+    const filtered = S.rows.size > 0 || !!S.search.trim() || S.nav !== "all";
+    $("#emptyTitle").textContent = filtered ? "No matches" : "No downloads yet";
+    $("#emptyHint").textContent = filtered ? "Try clearing your search or filter." : "Add a link to start downloading.";
+    $("#emptyAction").textContent = filtered ? "Clear search/filter" : "Add download";
+    $("#emptyAction").onclick = filtered ? () => {
+      S.search = ""; S.nav = "all"; $("#searchBox").value = ""; renderNav(); arrange();
+    } : () => invoke("open_add", { queue: navQueue() });
+  }
   for (const id of [...S.sel]) if (!S.rows.has(id)) S.sel.delete(id);
 }
 
@@ -246,12 +257,11 @@ function saveLayout() {
     const columns = {};
     S.cols.forEach((c, i) => (columns["Downloads:" + c.k] = { Width: Math.round(c.w), Order: i, Visible: c.visible }));
     for (const g of ["Trackers", "Peers", "Content"]) for (const [n, w] of Object.entries(S["w" + g] || {})) columns[`${g}:${n}`] = { Width: w, Order: 0, Visible: true };
-    const l = $("#genLeft").getBoundingClientRect().width, r = $("#genRight").getBoundingClientRect().width;
     invoke("save_layout", {
       columns,
       sidebar: $("#sidebar").getBoundingClientRect().width,
-      details: $("#details").getBoundingClientRect().height,
-      split: l + r > 0 ? l / (l + r) : 0.5,
+      details: $("#details").style.height ? parseFloat($("#details").style.height) : (S.settings?.DetailsHeight ?? 270),
+      split: parseFloat($("#genLeft").style.flexGrow) || S.settings?.DetailsSplit || 0.5,
     });
   }, 400);
 }
@@ -413,8 +423,10 @@ function renderStatus() {
   const s = S.summary;
   if (!s) return;
   let t = s.running === 0 ? `Idle · ${s.count} download${s.count === 1 ? "" : "s"}` : `${s.running} running · ${s.speedText || "0 B/s"}` + (s.total > 0 ? ` · ${fmtSize(s.done)} of ${fmtSize(s.total)}` : "");
+  if (s.seeding) t = (s.running ? t + " · " : "") + `Seeding ${s.seeding} · ↑ ${s.upSpeedText}`;
   if (s.schedule) t += ` · speed schedule active (${s.effectiveLimitText})`;
   $("#statusLeft").textContent = t;
+  $("#statusLeft").title = t;
   $("#statusTorrent").textContent = s.torrent || "";
   if (document.activeElement !== $("#limitInput") && S.settings && s.limitKBps !== S.settings.GlobalSpeedLimitKBps) {
     S.settings.GlobalSpeedLimitKBps = s.limitKBps;
@@ -496,18 +508,20 @@ const act = {
     if (!sel.length) return;
     const what = sel.length === 1 ? `“${sel[0].name}”` : `${sel.length} downloads`;
     if (sel.some((r) => r.status === "Completed")) {
+      const trash = el("input", { type: "checkbox" });
       const v = await new Promise((res) => modal({
         title: "Delete",
-        body: el("p", { text: `Remove ${what} from the list?` }),
+        body: el("div", {}, el("p", { text: `Remove ${what} from the list?` }),
+          el("label", { class: "check" }, trash, "Also delete the downloaded file(s)"),
+          el("p", { class: "hint", text: "Deleted files go to the Recycle Bin. Unfinished downloads lose their partial data." })),
         buttons: [
-          { label: "Cancel", value: null, left: true },
-          { label: "Keep files, just remove from list", value: "keep" },
-          { label: "Also move the files to the Recycle Bin", value: "trash", danger: true },
+          { label: "Cancel", value: false },
+          { label: "Remove", value: true, danger: true },
         ],
         onClose: res,
       }));
       if (!v) return;
-      await invoke("remove", { ids: sel.map((r) => r.id), deleteFiles: v === "trash" });
+      await invoke("remove", { ids: sel.map((r) => r.id), deleteFiles: trash.checked });
     } else {
       if (!(await confirmBox("Delete", `Remove ${what}? Partially downloaded data will be deleted.`, "Remove", true))) return;
       await invoke("remove", { ids: sel.map((r) => r.id), deleteFiles: false });
@@ -527,7 +541,7 @@ const act = {
     const r = S.rows.get(S.cur);
     if (!r) return;
     if (r.torrent) return alertBox("Refresh link", "Torrents find their peers by themselves — there's no link to refresh.");
-    const url = await promptBox("Refresh link", "Paste a fresh link for this file (e.g. copied again from the website). If the size matches, the bytes you already have are kept.", r.url, { mono: true });
+    const url = await promptBox("Refresh link", "Paste a fresh link for this file (e.g. copied again from the website). If the size matches, the bytes you already have are kept.", r.url, { mono: true, action: "Replace link" });
     if (!url || url.trim() === r.url) return;
     if (!/^https?:\/\//i.test(url.trim())) return alertBox("Refresh link", "That isn't an http(s) link.");
     let p;
@@ -535,7 +549,7 @@ const act = {
     catch (e) { return alertBox("Refresh link", "Couldn't reach the new link: " + e); }
     let restart = false;
     if (r.total > 0 && p.total !== r.total) {
-      if (!(await confirmBox("Refresh link", `The new link is ${fmtSize(p.total)} but the original was ${fmtSize(r.total)} — it's a different file.\nUse it anyway and start from zero?`, "Use it", true))) return;
+      if (!(await confirmBox("Refresh link", `The new link is ${fmtSize(p.total)} but the original was ${fmtSize(r.total)} — it's a different file.\nUse it anyway and start from zero?`, "Replace link", true))) return;
       restart = true;
     }
     await invoke("refresh_link", { id: r.id, url: url.trim(), restart });
@@ -544,7 +558,7 @@ const act = {
     const r = S.rows.get(S.cur);
     if (!r) return;
     if (r.video || r.torrent) return alertBox("Backup link", "Backup links are for normal file downloads, not video pages or torrents.");
-    const text = await promptBox("Add backup link", "Another link for exactly the same file (a mirror). FluxDM spreads connections across all links, and keeps going from the others if one dies. Several links can be pasted, one per line.", "", { multiline: true, mono: true });
+    const text = await promptBox("Add backup link", "Another link for exactly the same file (a mirror). FluxDM spreads connections across all links, and keeps going from the others if one dies. Several links can be pasted, one per line.", "", { multiline: true, mono: true, action: "Add backup links" });
     if (!text || !text.trim()) return;
     try { await invoke("add_mirrors", { id: r.id, text }); } catch (e) { alertBox("Backup link", String(e)); }
   },
@@ -553,7 +567,7 @@ const act = {
     if (!sel.length) return;
     let common = sel[0].tags;
     for (const r of sel.slice(1)) common = common.filter((t) => r.tags.some((x) => x.toLowerCase() === t.toLowerCase()));
-    const text = await promptBox("Edit tags", "Comma-separated labels for organising downloads (e.g. Games, Movies) — separate from the automatic file-type category. Leave empty to clear.", common.join(", "));
+    const text = await promptBox("Edit tags", "Comma-separated labels for organising downloads (e.g. Games, Movies) — separate from the automatic file-type category. Leave empty to clear.", common.join(", "), { action: "Save tags" });
     if (text == null) return;
     const seen = new Set();
     const tags = text.split(",").map((t) => t.trim()).filter((t) => t && !seen.has(t.toLowerCase()) && seen.add(t.toLowerCase()));
@@ -595,9 +609,9 @@ const act = {
   async addTrackers() {
     const ids = selected().filter((r) => r.torrent).map((r) => r.id);
     if (!ids.length) return;
-    const text = await promptBox("Add trackers", "Tracker URLs to add (one per line or separated by spaces), e.g. udp://tracker.opentrackr.org:1337/announce. More trackers can find more peers; they're kept for this torrent from now on.", "", { multiline: true, mono: true });
+    const text = await promptBox("Add trackers", "Tracker URLs to add (one per line or separated by spaces), e.g. udp://tracker.opentrackr.org:1337/announce. More trackers can find more peers; they're kept for this torrent from now on.", "", { multiline: true, mono: true, action: "Add trackers" });
     if (!text || !text.trim()) return;
-    try { await invoke("torrent_add_trackers", { ids, text }); } catch (e) { alertBox("Add trackers", String(e)); }
+    try { await invoke("torrent_add_trackers", { ids, text }); refreshDetails(); } catch (e) { alertBox("Add trackers", String(e)); }
   },
   copyTorrent: (what) => invoke("torrent_copy", { ids: selIds(), what }),
   async exportTorrent() {
@@ -613,7 +627,7 @@ const act = {
     const r = S.rows.get(S.cur);
     if (!r) return;
     const guess = await invoke("clean_title", { name: r.name });
-    const name = await promptBox("Find cover", "Game name to search for (Steam's store is searched):", guess);
+    const name = await promptBox("Find cover", "Game name to search for (Steam's store is searched):", guess, { action: "Find cover" });
     if (!name || !name.trim()) return;
     const found = await invoke("icon_find", { id: r.id, name: name.trim() });
     if (!found) alertBox("Find cover", `No game closely matching “${name.trim()}” was found. Try a shorter or more exact name, or choose an image.`);
@@ -639,6 +653,7 @@ async function limitMenuItems(title, what, key, presets, patchKey) {
     label: custom ? `Custom: ${fmtLimit(common)}…` : "Custom…", checked: custom,
     click: async () => {
       const t = await promptBox(title, `${what} for the selected download(s) — e.g. 750k, 2 MB/s or 0 for unlimited:`, common != null ? fmtLimit(common) : "1 MB/s", {
+        action: "Set speed limit",
         validate: (v) => (parseSpeed(v, patchKey !== "limitKBps") == null ? "Couldn't read that speed. Try 750k or 2 MB/s." : ""),
       });
       if (t != null) set(parseSpeed(t, patchKey !== "limitKBps"));
@@ -722,6 +737,8 @@ function renderDetails() {
   $("#dName").title = r.name;
   if (document.activeElement !== $("#dUrl")) $("#dUrl").value = r.url;
   $("#dPath").textContent = r.path;
+  $("#dPath").title = r.path;
+  $("#dUrl").title = r.url;
   $("#dProgress").textContent = r.downloadedText + (r.progressText && r.total > 0 ? ` (${r.progressText})` : "");
   $("#dResumable").textContent = r.torrent ? "Yes (torrent)" : r.video ? "Yes (yt-dlp keeps its own partial files)" : r.resumable ? "Yes" : r.total > 0 ? "No — the server doesn't support resuming" : "Not known yet";
   $("#dStatus").textContent = r.statusText;
@@ -750,14 +767,27 @@ function renderDetails() {
 }
 
 let detailsBusy = false;
-async function refreshDetails() {
+let detailsPending = false;
+let detailsKey = "";
+function detailsActive(r) { return r.running || r.seeding || ["Connecting", "Downloading", "Verifying"].includes(r.status); }
+function detailKey(r) {
+  return JSON.stringify([r.id, r.status, r.running, r.seeding, r.downloaded, r.total, r.path, r.limitKBps, r.uploadLimitKBps, r.seedingLimitKBps, r.connections, r.sequential, r.infoHash, r.cover]);
+}
+async function refreshDetails(periodic = false) {
   const r = S.cur ? S.rows.get(S.cur) : null;
-  if (!r || detailsBusy || document.hidden) return;
+  if (!r || document.hidden) return;
+  if (detailsBusy) {
+    if (periodic !== true) detailsPending = true;
+    return;
+  }
+  const key = detailKey(r);
+  if (periodic === true && S.details && !detailsActive(r) && detailsKey === key) return;
   detailsBusy = true;
   try {
     const d = await invoke("details", { id: r.id });
     if (S.cur !== r.id) return;
     S.details = d;
+    detailsKey = key;
     const cover = d && d.cover;
     const img = $("#dCover");
     if (cover) { if (img.getAttribute("src") !== cover) img.src = cover; img.hidden = false; } else img.hidden = true;
@@ -765,7 +795,10 @@ async function refreshDetails() {
     if (S.tab === "general") { drawSeg(); drawGraph(); }
     else if (d?.torrent) renderTorrentTab(d.torrent);
   } catch { /* the item went away */ }
-  finally { detailsBusy = false; }
+  finally {
+    detailsBusy = false;
+    if (detailsPending) { detailsPending = false; refreshDetails(); }
+  }
 }
 
 function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
@@ -862,7 +895,9 @@ function miniTable(table, grid, cols, rows) {
   // A dropdown being used would close under a re-render.
   if (document.activeElement?.tagName === "SELECT" && tb.contains(document.activeElement)) return;
   const html = rows.map((cells) => "<tr>" + cells.map((c) => `<td title="${esc(typeof c === "object" ? "" : c)}">${typeof c === "object" ? c.html : esc(c)}</td>`).join("") + "</tr>").join("");
-  if (tb._h !== html) { tb.innerHTML = html; tb._h = html; }
+  const empty = grid === "Trackers" ? "No trackers are available for this torrent." : grid === "Content" ? "No content information is available yet." : "";
+  const content = html || (empty ? `<tr class="empty-row"><td colspan="${cols.length}">${empty}</td></tr>` : "");
+  if (tb._h !== content) { tb.innerHTML = content; tb._h = content; }
 }
 
 function renderTorrentTab(t) {
@@ -870,8 +905,8 @@ function renderTorrentTab(t) {
     miniTable($("#trackerTable"), "Trackers", [["Tier", 44], ["URL", 320], ["Status", 120], ["Seeds", 60], ["Leeches", 66], ["Peers", 56], ["Next announce", 104], ["Message", 260]],
       t.trackers.map((x) => [
         x.tier,
-        { html: `<span class="${x.status === "Working" ? "st-Completed" : x.status === "Not working" ? "st-Error" : ""}" title="${esc(x.url)}">${esc(x.url)}${x.mine ? ' <span class="muted">(added by you)</span>' : ""}</span>` },
-        x.status, x.seeds, x.leeches, x.peers, x.next, x.message,
+        { html: `<span title="${esc(x.url)}">${esc(x.url)}${x.mine ? ' <span class="muted">(added by you)</span>' : ""}</span>` },
+        { html: `<span class="tracker-badge ${x.status === "Working" ? "st-Completed" : x.status === "Not working" ? "st-Error" : ""}">${esc(x.status)}</span>` }, x.seeds, x.leeches, x.peers, x.next, x.message,
       ]));
   } else if (S.tab === "peers") {
     const l = t.live;
@@ -904,11 +939,25 @@ async function openSettings() {
   if (!(s.TorrentMaxConnectionsPerTorrent > 0)) s.TorrentMaxConnectionsPerTorrent = 100;
   const formats = (await invoke("init")).formats;
   const f = {};
+  let fieldId = 0;
   const text = (key, attrs = {}) => (f[key] = el("input", { type: "text", value: s[key] ?? "", ...attrs }));
   const num = (key, w = 80) => (f[key] = el("input", { type: "number", value: s[key] ?? 0, style: { width: w + "px" } }));
   const chk = (key, label, title) => { const i = el("input", { type: "checkbox" }); i.checked = !!s[key]; f[key] = i; return el("label", { class: "check", title }, i, el("span", { text: label })); };
-  const speedBox = (key, allowNone) => { const i = el("input", { type: "text", style: { width: "110px" } }); i.value = s[key] === 0 ? "0" : fmtLimit(s[key]); i.dataset.none = allowNone ? "1" : ""; f[key] = i; return i; };
-  const field = (label, ...ctl) => el("div", { class: "field" }, el("span", { text: label }), el("div", { class: "row wrap" }, ...ctl));
+  const speedBox = (key, allowNone = false) => {
+    const i = el("input", { type: "text", "aria-label": "Speed limit" });
+    const box = el("div", { class: "speedbox" }, i, el("button", { type: "button", text: "▾", "aria-label": "Choose speed limit" }));
+    i.dataset.none = allowNone ? "1" : "";
+    f[key] = i;
+    speedCombo(box, { get: () => s[key] || 0, set: (v) => { s[key] = v; }, allowNone, presets: allowNone ? UPLOAD_PRESETS : LIMIT_PRESETS });
+    return box;
+  };
+  const field = (label, ...ctl) => {
+    const control = ctl.find((c) => c.matches?.("input, select, textarea")) || ctl.map((c) => c.querySelector?.("input, select, textarea")).find(Boolean);
+    if (control) { control.id ||= `settings-field-${++fieldId}`; control.setAttribute("aria-label", label); }
+    return el("div", { class: "field" }, el("label", { for: control?.id, text: label }),
+      el("div", { class: "field-control" }, el("div", { class: "row wrap" }, ...ctl.filter((c) => !c.classList?.contains("hint"))),
+        ...ctl.filter((c) => c.classList?.contains("hint"))));
+  };
   const hint = (t) => el("div", { class: "hint", style: { margin: "4px 0 8px" }, text: t });
   const section = (t) => el("h3", { class: "section", text: t });
 
@@ -929,9 +978,9 @@ async function openSettings() {
   fmtSel.value = s.DefaultVideoFormat;
   const cookieSel = el("select", {}, ...["Auto", "None", "Waterfox", "Firefox", "Chrome", "Edge", "Brave", "Opera", "Vivaldi"].map((x) => el("option", { value: x, text: x === "Auto" ? "Auto (Waterfox, else Firefox)" : x })));
   cookieSel.value = s.VideoCookiesBrowser || "Auto";
-  const ytStatus = el("span", { class: "hint grow", text: "Checking yt-dlp…" });
+  const ytStatus = el("span", { class: "hint grow", text: "Checking video tools…" });
   invoke("yt_version").then((v) => (ytStatus.textContent = v));
-  const ytBtn = el("button", { text: "Update yt-dlp", onclick: async () => { ytBtn.disabled = true; ytStatus.textContent = "Updating…"; ytStatus.textContent = await invoke("yt_update"); ytBtn.disabled = false; } });
+  const ytBtn = el("button", { text: "Update video tools", onclick: async () => { ytBtn.disabled = true; ytStatus.textContent = "Updating…"; ytStatus.textContent = await invoke("yt_update"); ytBtn.disabled = false; } });
 
   const fwText = (kind, span) => invoke("firewall_status", { kind }).then((ok) => {
     span.textContent = ok == null ? "" : ok ? "✓ Allowed through Windows Firewall (private networks)" : "Windows Firewall may block incoming connections.";
@@ -970,11 +1019,9 @@ async function openSettings() {
   themeSel.value = s.Theme || "System";
   const updStatus = el("span", { class: "hint grow" });
   const updBtn = el("button", { text: "Check now", onclick: async () => {
-    s.UpdateRepo = f.UpdateRepo.value.trim();
     updStatus.textContent = "Checking…";
     try {
-      await saveSettingsQuiet();
-      const rel = await invoke("check_update");
+      const rel = await invoke("check_update", { repo: f.UpdateRepo.value.trim() });
       if (rel) { S.update = rel; $("#updateBadge").hidden = false; $("#btnUpdate").textContent = `Update to ${rel.version}`; updStatus.textContent = `Version ${rel.version} is available.`; }
       else updStatus.textContent = "You have the latest version.";
     } catch (e) { updStatus.textContent = String(e); }
@@ -982,31 +1029,27 @@ async function openSettings() {
 
   const body = el("div", {},
     section("Downloads"),
-    el("div", { text: "Default save folder" }),
-    el("div", { class: "row", style: { margin: "4px 0 8px" } }, text("DefaultFolder", { class: "grow" }), browse),
+    field("Default save folder", text("DefaultFolder", { class: "grow" }), browse),
     chk("CategorySubfolders", "Sort into sub-folders by type (Video, Music, Programs, AI Models…)"),
-    el("div", { text: "Default connections per download", style: { marginTop: "10px" } }),
-    el("div", { class: "row" }, conn, connVal),
-    hint("8–16 is the sweet spot for most servers. Too many can get you rate-limited — FluxDM backs off automatically if that happens."),
+    field("Connections per download", conn, connVal, el("span", { class: "hint", text: "8–16 works well for most websites." })),
     field("Global speed limit", speedBox("GlobalSpeedLimitKBps"), el("span", { class: "hint", text: "e.g. 750k, 2 MB/s — 0 = unlimited" })),
 
     section("Speed schedule"),
     chk("SpeedScheduleEnabled", "Limit the speed during part of the day"),
-    el("div", { class: "row wrap", style: { marginLeft: "23px" } }, "From", text("ScheduleFrom", { style: { width: "70px" } }), "to", text("ScheduleTo", { style: { width: "70px" } }), "limit everything to", speedBox("ScheduleLimitKBps")),
+    field("Hours (24-hour time)", text("ScheduleFrom", { style: { width: "70px" } }), "to", text("ScheduleTo", { style: { width: "70px" } })),
+    field("Scheduled speed limit", speedBox("ScheduleLimitKBps")),
     hint("Outside these hours the normal global limit applies. The window may cross midnight (e.g. 23:00 to 07:00). If both limits apply, the stricter one wins."),
 
     section("Reliability"),
     field("Retries per connection", num("MaxRetries")),
     field("Reconnect a stalled connection after (s)", num("ReadTimeoutSec")),
     field("Auto-retry failed files in a running queue", num("QueueRetries")),
-    el("div", { text: "User-Agent", style: { marginTop: "8px" } }),
-    text("UserAgent", { style: { width: "100%", marginTop: "4px" }, class: "mono" }),
 
-    section("Browser & clipboard"),
+    section("Browser integration"),
     chk("ClipboardMonitor", "Watch the clipboard — copying a download link opens the Add dialog"),
-    el("div", { text: "File types to catch", style: { marginTop: "8px" } }),
-    text("ClipboardExtensions", { style: { width: "100%", marginTop: "4px" } }),
-    el("div", { class: "row", style: { marginTop: "12px" } }, chk("LocalApiEnabled", "Browser bridge on 127.0.0.1, port"), num("LocalApiPort")),
+    field("File types to catch", text("ClipboardExtensions", { class: "grow" })),
+    chk("LocalApiEnabled", "Allow the browser extension to send downloads here"),
+    field("Browser integration port", num("LocalApiPort")),
     hint("Browser bookmarklets: create a new bookmark and paste one of these as its URL. They only open FluxDM's Add dialog — nothing downloads without your click. Only programs on this PC can reach the bridge."),
     el("b", { text: "“Send to FluxDM” — sends the current page/file URL" }),
     el("div", { class: "row", style: { margin: "4px 0 8px" } }, sendBm, el("button", { text: "Copy", onclick: () => invoke("copy_text", { text: sendBm.value }) })),
@@ -1023,11 +1066,10 @@ async function openSettings() {
     chromiumButtons.length ? el("div", { class: "row wrap", style: { margin: "4px 0 8px" } }, ...chromiumButtons) : hint("No Chromium browser found on this PC."),
     el("button", { text: "Open extension folder", onclick: () => invoke("open_extension_folder").catch((e) => alertBox("Extension", String(e))) }),
 
-    section("Video downloads (yt-dlp)"),
+    section("Download videos and audio"),
     hint("For YouTube and 1000+ other sites: tick “Download as video” in the Add window, or right-click a page → Download video with FluxDM. yt-dlp and ffmpeg are fetched once from their official releases on first use and kept in FluxDM's data folder."),
     field("Default quality", fmtSel),
-    field("Use browser cookies from", cookieSel),
-    hint("Only needed for age-restricted, private or members-only videos. Waterfox works while it's open; Chrome and Edge often lock their cookies."),
+    field("Use browser cookies from", cookieSel, el("span", { class: "hint", text: "Needed for private or age-restricted videos. Close Chrome or Edge first." })),
     el("div", { class: "row" }, ytStatus, ytBtn),
 
     section("Torrents (built-in engine)"),
@@ -1047,7 +1089,8 @@ async function openSettings() {
 
     section("Phone remote"),
     chk("RemoteEnabled", "Control FluxDM from my phone on the home Wi-Fi"),
-    el("div", { class: "row wrap", style: { marginLeft: "23px" } }, "Port", num("RemotePort"), "PIN", text("RemotePin", { class: "mono", style: { width: "100px" } }), newPin, pair),
+    field("Phone connection port", num("RemotePort")),
+    field("Phone PIN", text("RemotePin", { class: "mono", style: { width: "100px" } }), newPin, pair),
     el("div", { class: "row", style: { marginLeft: "23px", marginTop: "6px" } }, rFw, fwBtn("remote", rFw)),
     hint("Your phone opens a web page served by this PC — no app or account needed. Anyone on your network also needs the PIN; 10 wrong PINs lock that device out for 5 minutes."),
 
@@ -1061,9 +1104,11 @@ async function openSettings() {
     field("Theme", themeSel),
 
     section("Updates"),
-    field("Update source (GitHub owner/repo)", text("UpdateRepo", { class: "mono", style: { width: "260px" }, placeholder: "owner/FluxDM" })),
     chk("AutoCheckUpdates", "Check for a new version when FluxDM starts"),
     el("div", { class: "row" }, updStatus, updBtn),
+    section("Advanced"),
+    field("User-Agent", text("UserAgent", { class: "mono grow" })),
+    field("Update source (GitHub owner/repo)", text("UpdateRepo", { class: "mono grow", placeholder: "owner/FluxDM" })),
     el("div", { class: "hint", style: { marginTop: "14px" }, text: `FluxDM ${(await invoke("init")).version} · data folder: ${g.dataDir}` }),
   );
 
@@ -1085,7 +1130,15 @@ async function openSettings() {
     out.TorrentSeedRatio = Number(f.TorrentSeedRatio.value) || 0;
     return out;
   }
-  async function saveSettingsQuiet() { await invoke("save_settings", { settings: collect() }); }
+
+  let group;
+  for (const child of [...body.children]) {
+    if (child.matches("h3.section")) {
+      group = el("section", { class: "settings-group" });
+      body.append(group);
+    }
+    group.append(child);
+  }
 
   // Section list on the left: jump to a section, and it follows as you scroll.
   const nav = el("div", { class: "settings-nav" });
@@ -1163,8 +1216,9 @@ async function openScheduler(focusName) {
     const maxVal = el("b", { text: q.MaxConcurrent, style: { width: "22px", textAlign: "right" } });
     max.addEventListener("input", () => (maxVal.textContent = max.value));
     max.addEventListener("change", () => { q.MaxConcurrent = +max.value; commit(); });
-    const lim = el("input", { type: "text", value: q.SpeedLimitKBps ? fmtLimit(q.SpeedLimitKBps) : "0", style: { width: "110px" }, title: "Shared by all downloads in this queue. KB/s, or 500k / 2 MB/s. 0 = unlimited." });
-    lim.addEventListener("change", () => { const v = parseSpeed(lim.value); if (v == null) { lim.classList.add("invalid"); return; } lim.classList.remove("invalid"); q.SpeedLimitKBps = v; commit(); });
+    const lim = el("div", { class: "speedbox" }, el("input", { type: "text", "aria-label": "Queue speed limit" }),
+      el("button", { type: "button", text: "▾", "aria-label": "Choose speed limit" }));
+    speedCombo(lim, { get: () => q.SpeedLimitKBps, set: (v) => { q.SpeedLimitKBps = v; commit(); } });
     const days = el("div", { class: "days" }, ...DAYS.map((d) => {
       const i = el("input", { type: "checkbox" });
       i.checked = !!(q.DaysMask & (1 << DAYBIT[d]));
@@ -1225,7 +1279,7 @@ async function openScheduler(focusName) {
     right);
   const startBtn = el("button", { text: "Start now", onclick: async () => { await invoke("queue_run", { name: cur, on: true }); reload(); } });
   const stopBtn = el("button", { text: "Stop", onclick: async () => { await invoke("queue_run", { name: cur, on: false }); reload(); } });
-  const m = modal({ title: "Scheduler", body, xwide: true, buttons: [{ label: "Close", primary: true }] });
+  const m = modal({ title: "Scheduler", body, xwide: true, backdrop: false, buttons: [{ label: "Close", primary: true }] });
   m.box.querySelector("footer").prepend(startBtn, stopBtn);
   draw();
 }
@@ -1279,8 +1333,8 @@ function showCountdown(p) {
   const m = modal({
     title: `Queue “${p.queue}” finished`,
     body: el("div", {}, el("p", { text: `${words[p.action] || p.action} in` }), num, el("p", { class: "hint", text: "seconds. Cancel to stay as you are." })),
-    buttons: [{ label: "Cancel", primary: true }, { label: "Do it now", value: "now" }],
-    onClose: (v) => { clearInterval(t); if (v === "now") invoke("run_post_action", { action: p.action }); },
+    buttons: [{ label: "Cancel", primary: true }, { label: ({ Exit: "Exit FluxDM now", Sleep: "Sleep now", Hibernate: "Hibernate now", Shutdown: "Shut down now", Restart: "Restart now" })[p.action] || "Run now", value: "now" }],
+    onClose: (v) => { clearInterval(t); if (v === "now") invoke("run_post_action", { action: p.action, force: p.force }); },
   });
   const t = setInterval(() => {
     n--;
@@ -1292,11 +1346,29 @@ function showCountdown(p) {
 async function offerFirewall(p) {
   const remote = p.kind === "remote";
   const ok = remote
-    ? await confirmBox("Phone remote", "Windows Firewall will block your phone from reaching FluxDM.\n\nAllow FluxDM on private (home) networks now? Windows will ask for permission.", "Allow")
-    : await confirmBox("Let peers reach you?", "Windows Firewall blocks other BitTorrent peers from connecting to FluxDM, so you only reach the peers you connect out to — usually fewer seeders and slower torrents.\n\nAllow FluxDM on private networks? Windows will ask for permission.", "Allow");
+    ? await confirmBox("Phone remote", "Windows Firewall will block your phone from reaching FluxDM.\n\nAllow FluxDM on private (home) networks now? Windows will ask for permission.", "Allow phone connections")
+    : await confirmBox("Let peers reach you?", "Windows Firewall blocks other BitTorrent peers from connecting to FluxDM, so you only reach the peers you connect out to — usually fewer seeders and slower torrents.\n\nAllow FluxDM on private networks? Windows will ask for permission.", "Allow peer connections");
   if (ok) {
     try { await invoke("firewall_allow", { kind: p.kind }); } catch (e) { alertBox("Firewall", String(e)); }
   }
+}
+
+function releaseNotes(text) {
+  const body = el("div", { class: "release-notes selectable" });
+  let paragraph = [], list;
+  const flush = () => { if (paragraph.length) body.append(el("p", { text: paragraph.join(" ") })); paragraph = []; };
+  for (const line of String(text).replace(/\r/g, "").split("\n")) {
+    const heading = /^#{1,6}\s+(.+)$/.exec(line);
+    const bullet = /^\s*(?:[-*+] |\d+\. )(.+)$/.exec(line);
+    if (!line.trim() || heading || bullet) flush();
+    if (heading) { list = null; body.append(el("h4", { text: heading[1] })); }
+    else if (bullet) {
+      if (!list) { list = el("ul"); body.append(list); }
+      list.append(el("li", { text: bullet[1] }));
+    } else { list = null; if (line.trim()) paragraph.push(line.trim()); }
+  }
+  flush();
+  return body;
 }
 
 async function showUpdate() {
@@ -1306,7 +1378,7 @@ async function showUpdate() {
   modal({
     title: `FluxDM ${rel.version} is available`,
     body: el("div", {}, el("p", { text: `You have ${(await invoke("init")).version}. The update downloads ${rel.size ? fmtSize(rel.size) : "the new FluxDM.exe"}, checks its SHA-256 and restarts FluxDM. Running downloads pause and continue after.` }),
-      rel.notes ? el("pre", { class: "selectable hint", style: { whiteSpace: "pre-wrap", maxHeight: "240px", overflow: "auto" }, text: rel.notes }) : null, prog),
+      rel.notes ? releaseNotes(rel.notes) : null, prog),
     buttons: [{ label: "Later" }, {
       label: "Update now", primary: true,
       click: async (btn) => {
@@ -1355,6 +1427,51 @@ function wireDrop() {
 
 function navQueue() { return S.nav.startsWith("q:") ? S.nav.slice(2) : null; }
 
+function focusSearch() {
+  $("#search").classList.add("open");
+  $("#searchToggle").setAttribute("aria-expanded", "true");
+  $("#searchBox").focus();
+}
+
+function responsiveToolbar() {
+  const group = $(".tb-group"), more = $("#btnMore");
+  const buttons = $$("button", group).filter((b) => b !== more);
+  const labels = new Map(buttons.map((b) => [b, b.getAttribute("aria-label")]));
+  // Add, Resume and Pause stay directly available.
+  const priority = ["btnColumns", "btnStats", "btnClear", "btnScheduler", "btnPauseAll", "btnSettings", "btnDelete"];
+  let overflow = [];
+  const fit = () => {
+    buttons.forEach((b) => { b.hidden = false; });
+    more.hidden = true;
+    overflow = [];
+    for (const id of priority) {
+      if (group.scrollWidth <= group.clientWidth && !(innerWidth <= 760 && overflow.length < 3)) break;
+      const button = document.getElementById(id);
+      button.hidden = true;
+      more.hidden = false;
+      overflow.push(button);
+    }
+  };
+  more.onclick = () => {
+    const r = more.getBoundingClientRect();
+    showMenu(overflow.map((b) => ({ label: labels.get(b), title: b.title, disabled: b.disabled, click: () => b.click() })), r.left, r.bottom + 4);
+  };
+  const observer = new ResizeObserver(fit);
+  observer.observe($("#toolbar"));
+  observer.observe(group);
+  observer.observe($("#updateBadge"));
+  fit();
+  $("#searchToggle").onclick = focusSearch;
+  const closeSearch = () => {
+    $("#search").classList.remove("open");
+    $("#searchToggle").setAttribute("aria-expanded", "false");
+  };
+  $("#search").addEventListener("focusout", (e) => { if (!$("#search").contains(e.relatedTarget)) closeSearch(); });
+  $("#searchBox").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.stopPropagation(); closeSearch(); $("#searchToggle").focus(); }
+  });
+}
+
 function wire() {
   $("#btnAdd").onclick = () => invoke("open_add", { queue: navQueue() });
   $("#btnResume").onclick = act.resume;
@@ -1364,9 +1481,10 @@ function wire() {
   $("#btnClear").onclick = act.clearFinished;
   $("#btnScheduler").onclick = () => openScheduler();
   $("#btnStats").onclick = openStats;
-  $("#btnColumns").onclick = (e) => { const r = e.currentTarget.getBoundingClientRect(); columnsMenu(r.left, r.bottom + 4); };
+  $("#btnColumns").onclick = (e) => { const r = (e.currentTarget.hidden ? $("#btnMore") : e.currentTarget).getBoundingClientRect(); columnsMenu(r.left, r.bottom + 4); };
   $("#btnSettings").onclick = openSettings;
   $("#btnUpdate").onclick = showUpdate;
+  responsiveToolbar();
   $("#queueStart").onclick = () => invoke("queue_run", { name: S.nav.slice(2), on: true });
   $("#queueStop").onclick = () => invoke("queue_run", { name: S.nav.slice(2), on: false });
 
@@ -1446,7 +1564,7 @@ function wire() {
     if ($(".modal-back")) return;
     const inText = e.target.matches("input, textarea, select");
     if (e.ctrlKey && e.key.toLowerCase() === "n") { e.preventDefault(); invoke("open_add", { queue: navQueue() }); return; }
-    if (e.ctrlKey && e.key.toLowerCase() === "f") { e.preventDefault(); $("#searchBox").focus(); $("#searchBox").select(); return; }
+    if (e.ctrlKey && e.key.toLowerCase() === "f") { e.preventDefault(); focusSearch(); $("#searchBox").select(); return; }
     if (inText) return;
     if (e.ctrlKey && e.key.toLowerCase() === "v") { e.preventDefault(); const u = await invoke("clipboard_url"); invoke("open_add", { urls: u || "" }); return; }
     if (e.ctrlKey && e.key.toLowerCase() === "a") { e.preventDefault(); S.sel = new Set(visibleIds()); paintSel(); return; }

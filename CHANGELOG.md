@@ -2,6 +2,32 @@
 
 What changed for people using FluxDM. Developer notes are in `PROJECT_STATE.md`.
 
+## Unreleased
+
+### Fixed
+- Dialogs keep keyboard focus inside, offer a close button, protect forms from backdrop clicks and wrap footer actions.
+- Removal uses one action with an optional Recycle Bin checkbox; prompts and countdowns name their actions, and update notes use readable formatting.
+- Settings groups align controls, simplify wording and share speed presets with Scheduler. Theme changes reach open windows and native title bars.
+- Small desktop windows keep toolbar actions in More, collapse details when short, and stack cramped General, Scheduler and Add layouts; the main minimum is now 640x420.
+- Frozen windows can recover after a repaint attempt. Recovery waits while you are away, the session is locked or the display is off, and gives the window time to recover when you return.
+- Queue completion and shutdown/sleep countdowns depend only on downloads started during that queue run. Older failed or paused entries do not block completion; paused or failed downloads from the current run still do, and removed downloads are ignored. Each countdown keeps its captured force setting.
+- Adding the same torrent again keeps the existing download and shows its name and status, including when adding several links or resolving magnet metadata.
+- Pausing a checksum check keeps the download paused. Resuming checks the saved file again before marking it complete, notifying you or opening it.
+- Updates resume the previous downloads and queues once. If the updated version cannot start, FluxDM stays open and resumes downloading.
+- “Check now” in Settings checks the entered repository without saving other changes in the form.
+- Enter and Escape affect only the top dialog after its controls have handled their own keys. Enter chooses the intended primary button, and closing a dialog restores the previous focus.
+- HTTP downloads restart safely when the source file changes, while different mirror identifiers preserve progress.
+- Moving torrent files refuses existing destination files. If a copy fails, partial copies are removed and the original location is kept.
+- Global and queue speed budgets share spare bandwidth fairly across downloads, torrents and videos. Videos reconnect only for substantial speed changes, at most once a minute.
+- Torrent upload limits apply separately to downloading and seeding torrents. Disabling uploads while downloading no longer blocks finished torrents from sharing, and seeding caps still apply during other downloads.
+- Incoming links merge into matching Add forms; requests with different headers, filenames, queues or video choices stay separate, including while forms load.
+- Authenticated .torrent links keep their browser request headers when fetching metadata. Redirects to a different origin receive none of those custom headers.
+- The browser extension leaves POST downloads and their redirects in the browser.
+- Removing or restarting new video jobs cleans their partial files and fragments. Finished outputs follow Keep files or Recycle Bin choices; cleanup failures remain available to retry. Older untracked partials need manual cleanup.
+- Finished playlists show the combined file size, and Open / Show in folder target the playlist folder.
+- Seeding torrents show their upload speed and peers in the list, and the footer shows the seeding count and upload speed.
+- Inactive torrent details stop polling and redrawing until relevant data changes. Selection and content edits still refresh, including while an earlier request is in flight. Parsed torrent metadata is cached while its file stays unchanged.
+
 ## 2.2.1 — 2026-10-26
 
 ### New

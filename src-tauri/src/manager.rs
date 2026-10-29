@@ -21,6 +21,12 @@ pub struct State {
     pub stats: StatsStore,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct UpdateResume {
+    items: Vec<(String, DlStatus)>,
+    queues: Vec<(String, HashSet<String>)>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Http,
@@ -49,11 +55,12 @@ pub struct Run {
     pub throttled: AtomicI32,
     /// yt-dlp's best estimate of the total size.
     pub total_hint: AtomicI64,
-    /// This item's own speed limit.
+    /// This item's allocated share, tightened by its own speed limit.
     pub limiter: Limiter,
-    /// The limit a yt-dlp/torrent download started with — they can only take a new one by restarting.
+    /// The limit a yt-dlp download started with (fixed for that process).
     pub started_limit: AtomicI64,
     restart_requested: AtomicBool,
+    created_at: Instant,
     ended: watch::Sender<bool>,
     book: Mutex<SpeedBook>,
 }
@@ -61,6 +68,17 @@ pub struct Run {
 impl Run {
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    #[cfg(test)]
+    pub fn test_run(id: &str) -> Arc<Self> {
+        let (ended, _) = watch::channel(false);
+        Arc::new(Self {
+            id: id.into(), kind: Kind::Http, cancel: CancellationToken::new(),
+            bytes: AtomicI64::new(0), current: AtomicI64::new(0), active: AtomicI32::new(0), throttled: AtomicI32::new(0),
+            total_hint: AtomicI64::new(0), limiter: Limiter::default(), started_limit: AtomicI64::new(-1),
+            restart_requested: AtomicBool::new(false), created_at: Instant::now(), ended, book: Mutex::new(SpeedBook::default()),
+        })
     }
 }
 
@@ -89,6 +107,44 @@ pub struct Manager {
 
 const STALL_THRESHOLD: Duration = Duration::from_secs(100);
 const STALL_COOLDOWN: Duration = Duration::from_secs(180);
+
+/// Progressive filling freezes only consumers that hit demand, item or queue caps.
+fn download_allocations(demand: &[i64], groups: &[usize], queues: &[i64], global: i64) -> Vec<i64> {
+    let cap = |v: i64| if v > 0 { v as f64 } else { f64::INFINITY };
+    let mut allocated = vec![0.0; demand.len()];
+    let mut active = vec![true; demand.len()];
+    loop {
+        let count = active.iter().filter(|v| **v).count();
+        if count == 0 { break; }
+        let mut step = (cap(global) - allocated.iter().sum::<f64>()) / count as f64;
+        for (i, on) in active.iter().enumerate() {
+            if *on { step = step.min(cap(demand[i]) - allocated[i]); }
+        }
+        for (q, limit) in queues.iter().enumerate() {
+            let count = (0..demand.len()).filter(|i| active[*i] && groups[*i] == q).count();
+            if count > 0 {
+                let used: f64 = allocated.iter().enumerate().filter(|(i, _)| groups[*i] == q).map(|(_, v)| v).sum();
+                step = step.min((cap(*limit) - used) / count as f64);
+            }
+        }
+        for (i, on) in active.iter().enumerate() {
+            if *on { allocated[i] += step.max(0.0); }
+        }
+        let global_full = allocated.iter().sum::<f64>() >= cap(global) - 0.5;
+        let queue_full: Vec<bool> = queues.iter().enumerate().map(|(q, limit)| {
+            allocated.iter().enumerate().filter(|(i, _)| groups[*i] == q).map(|(_, v)| v).sum::<f64>() >= cap(*limit) - 0.5
+        }).collect();
+        for i in 0..active.len() {
+            if global_full || queue_full[groups[i]] || allocated[i] >= cap(demand[i]) - 0.5 { active[i] = false; }
+        }
+    }
+    allocated.into_iter().map(|v| if v.is_infinite() { 0 } else { (v as i64).max(1) }).collect()
+}
+
+fn video_budget_changed(started: i64, current: i64, elapsed: Duration) -> bool {
+    elapsed >= Duration::from_secs(60) && started >= 0 && started != current
+        && (started == 0 || current == 0 || (current - started).abs() as f64 > started as f64 * 0.30)
+}
 
 impl Manager {
     pub fn new() -> Arc<Self> {
@@ -196,23 +252,41 @@ impl Manager {
         }
     }
 
-    /// The tightest limit currently applying to this item, in bytes/s (0 = none).
-    pub fn effective_limit(&self, run: &Run, queue: &str) -> i64 {
-        let mut best = 0i64;
-        let mut take = |v: i64| {
-            if v > 0 && (best == 0 || v < best) {
-                best = v;
-            }
-        };
-        take(self.global_limiter.get());
-        take(self.queue_limiter(queue).map(|q| q.get()).unwrap_or(0));
-        take(run.limiter.get());
-        best
+    /// Share spare capacity across engines, with growth headroom for idle consumers.
+    fn refresh_limits(&self) {
+        let runs = self.running.lock().clone();
+        let st = self.st.lock();
+        let consumers: Vec<&Item> = st.items.iter().filter(|i| runs.contains_key(&i.id)).collect();
+        let global = Self::effective_global_kbps(&st.settings) as i64 * 1024;
+        self.global_limiter.set(global);
+        for q in &st.queues {
+            if let Some(l) = self.queue_limiter(&q.name) { l.set(q.speed_limit_kbps as i64 * 1024); }
+        }
+        let mut queue_names = vec![String::new()];
+        let mut budgets = vec![0];
+        for q in &st.queues {
+            if !q.name.is_empty() { queue_names.push(q.name.clone()); budgets.push(q.speed_limit_kbps as i64 * 1024); }
+        }
+        let groups: Vec<usize> = consumers.iter().map(|it| queue_names.iter().position(|q| q == &it.queue_name).unwrap_or(0)).collect();
+        let demands: Vec<i64> = consumers.iter().enumerate().map(|(i, it)| {
+            let run = &runs[&it.id];
+            let book = run.book.lock();
+            let started = run.started_limit.load(Ordering::Relaxed);
+            // A busy fixed-rate process cannot grow into headroom without a reconnect.
+            let busy_video = run.kind == Kind::Video && started > 0 && book.smooth >= started as f64 * 0.8;
+            let measured = if (global > 0 || budgets[groups[i]] > 0) && book.last_t.is_some() && !busy_video {
+                ((book.smooth * 1.25) as i64).max(4096)
+            } else { 0 };
+            [measured, it.speed_limit_kbps as i64 * 1024].into_iter().filter(|v| *v > 0).min().unwrap_or(0)
+        }).collect();
+        for (it, limit) in consumers.iter().zip(download_allocations(&demands, &groups, &budgets, global)) {
+            runs[&it.id].limiter.set(limit);
+        }
     }
 
     // ------------------------------------------------------------------ persistence
 
-    pub fn load(self: &Arc<Self>) {
+    pub fn load(self: &Arc<Self>, updated: bool) {
         let mut settings: Settings = store::read("settings.json").unwrap_or_default();
         if settings.remote_pin.len() < 4 {
             settings.remote_pin = crate::util::random_pin();
@@ -235,10 +309,7 @@ impl Manager {
         let mut items: Vec<Item> = store::read("downloads.json").unwrap_or_default();
         for it in &mut items {
             *it.segments.lock() = it.saved_segments.iter().cloned().map(|s| Arc::new(Mutex::new(s))).collect();
-            if it.status == DlStatus::Verifying && !it.is_torrent && std::path::Path::new(&it.full_path()).exists() {
-                it.error_message = "checksum not verified (app was closed)".into();
-                it.status = DlStatus::Completed;
-            } else if it.is_active() {
+            if it.is_active() {
                 it.status = DlStatus::Paused;
             }
         }
@@ -249,10 +320,64 @@ impl Manager {
             st.stats = stats;
             st.items = items;
         }
+        self.start_loaded(updated, &store::path("update-resume.json"));
+    }
+
+    fn start_loaded(self: &Arc<Self>, updated: bool, resume_path: &std::path::Path) {
+        if updated {
+            if let Some(resume) = Self::take_update_resume(resume_path) {
+                self.resume_after_update(&resume);
+                return;
+            }
+        }
+        let _ = std::fs::remove_file(resume_path);
         let launch: Vec<String> = self.st.lock().queues.iter().filter(|q| q.start_on_launch).map(|q| q.name.clone()).collect();
         for q in launch {
             self.start_queue(&q);
         }
+    }
+
+    fn take_update_resume(path: &std::path::Path) -> Option<UpdateResume> {
+        let resume = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        std::fs::remove_file(path).ok()?;
+        Some(resume)
+    }
+
+    pub fn update_resume(&self) -> UpdateResume {
+        let running: HashSet<String> = self.running.lock().keys().cloned().collect();
+        let st = self.st.lock();
+        UpdateResume {
+            items: st.items.iter().filter(|i| running.contains(&i.id) || i.is_active() || i.status == DlStatus::Queued
+                || (i.is_torrent && i.status == DlStatus::Completed && self.torrents.find(&i.info_hash).is_some_and(|h| !h.is_paused())))
+                .map(|i| (i.id.clone(), i.status)).collect(),
+            queues: st.queues.iter().filter(|q| q.running).map(|q| (q.name.clone(), q.started_ids.clone())).collect(),
+        }
+    }
+
+    fn apply_update_resume(st: &mut State, resume: &UpdateResume) -> Vec<String> {
+        for q in &mut st.queues {
+            q.running = resume.queues.iter().any(|(name, _)| name == &q.name);
+            q.started_ids = resume.queues.iter().find(|(name, _)| name == &q.name).map(|(_, ids)| ids.clone()).unwrap_or_default();
+        }
+        let mut start = vec![];
+        for (id, status) in &resume.items {
+            if let Some(it) = st.items.iter_mut().find(|i| &i.id == id) {
+                if *status == DlStatus::Queued {
+                    it.status = DlStatus::Queued;
+                } else if it.status != DlStatus::Completed || *status == DlStatus::Completed {
+                    start.push(id.clone());
+                }
+            }
+        }
+        start
+    }
+
+    pub fn resume_after_update(self: &Arc<Self>, resume: &UpdateResume) {
+        let start = Self::apply_update_resume(&mut self.st.lock(), resume);
+        for id in start { self.start(&id); }
+        self.pump_queues();
+        self.save();
+        self.push_list();
     }
 
     pub fn save(&self) {
@@ -406,14 +531,26 @@ impl Manager {
     }
 
     pub fn add(self: &Arc<Self>, items: Vec<Item>, start: bool) {
-        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        let mut ids = vec![];
+        let mut duplicates = vec![];
         {
             let mut st = self.st.lock();
             for mut it in items {
+                if it.is_torrent {
+                    if it.info_hash.is_empty() {
+                        it.info_hash = crate::torrent::source_hash(&it.url).unwrap_or_default();
+                    }
+                    if let Some(existing) = st.items.iter().find(|o| Self::same_torrent(o, &it.info_hash)) {
+                        duplicates.push(existing.clone());
+                        continue;
+                    }
+                }
                 it.status = if !start && !it.queue_name.is_empty() { DlStatus::Queued } else { DlStatus::Paused };
+                ids.push(it.id.clone());
                 st.items.insert(0, it);
             }
         }
+        for it in duplicates { self.torrent_duplicate(&it); }
         if start {
             for id in &ids {
                 self.start(id);
@@ -423,6 +560,34 @@ impl Manager {
         self.save();
         self.push_list();
         crate::covers::refresh_ids(self, &ids);
+    }
+
+    fn same_torrent(it: &Item, hash: &str) -> bool {
+        it.is_torrent && !hash.is_empty() && (it.info_hash.eq_ignore_ascii_case(hash)
+            || (it.info_hash.is_empty() && crate::torrent::source_hash(&it.url).is_some_and(|h| h.eq_ignore_ascii_case(hash))))
+    }
+
+    fn torrent_duplicate(&self, it: &Item) {
+        self.toast("Torrent already in the list", &format!("{} — {}", it.file_name, it.status_text()), None);
+        self.emit("torrent-duplicate", json!({ "id": it.id }));
+    }
+
+    /// Claim a resolved hash under the list lock, before touching the engine or data.
+    pub fn claim_torrent_hash(&self, id: &str, hash: &str) -> bool {
+        let duplicate = {
+            let mut st = self.st.lock();
+            let duplicate = st.items.iter().find(|i| i.id != id && Self::same_torrent(i, hash)).cloned();
+            if duplicate.is_some() {
+                st.items.retain(|i| i.id != id);
+            } else if let Some(it) = st.items.iter_mut().find(|i| i.id == id) {
+                it.info_hash = hash.to_string();
+            } else { return false; }
+            duplicate
+        };
+        if let Some(it) = duplicate {
+            self.torrent_duplicate(&it);
+            false
+        } else { true }
     }
 
     // ------------------------------------------------------------------ start / stop
@@ -461,13 +626,17 @@ impl Manager {
             limiter: Limiter::default(),
             started_limit: AtomicI64::new(-1),
             restart_requested: AtomicBool::new(false),
+            created_at: Instant::now(),
             ended: tx,
-            book: Mutex::new(SpeedBook { last_t: Some(Instant::now()), ..Default::default() }),
+            book: Mutex::new(SpeedBook::default()),
         });
         run.limiter.set(limit as i64 * 1024);
-        let _ = queue;
         running.insert(id.to_string(), run.clone());
+        if let Some(q) = self.st.lock().queues.iter_mut().find(|q| q.name == queue && q.running) {
+            q.started_ids.insert(id.to_string());
+        }
         drop(running);
+        self.refresh_limits();
         self.with_item(id, |it| {
             it.not_before = None;
             it.set_status(DlStatus::Connecting);
@@ -491,6 +660,7 @@ impl Manager {
                 running.remove(&run.id);
             }
         }
+        self.refresh_limits();
         let settings = self.settings();
         let mut completed: Option<Item> = None;
         let mut failed: Option<Item> = None;
@@ -555,7 +725,11 @@ impl Manager {
     /// Stops a download and waits until it has fully let go (so an immediate start isn't ignored).
     pub async fn pause(self: &Arc<Self>, id: &str) {
         if let Some(run) = self.run_of(id) {
-            run.cancel.cancel();
+            {
+                // Serialize a pause with the runner's final completion step.
+                let _st = self.st.lock();
+                run.cancel.cancel();
+            }
             let mut rx = run.ended.subscribe();
             let _ = tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|v| *v)).await;
             return;
@@ -595,6 +769,12 @@ impl Manager {
     pub async fn remove(self: &Arc<Self>, id: &str, delete_file: bool) {
         self.pause(id).await;
         let Some(it) = self.item(id) else { return };
+        if it.is_video {
+            if self.is_running(id) { return self.toast("Couldn't remove video", "The video process is still stopping. Try again shortly.", None); }
+            if delete_file || it.status != DlStatus::Completed {
+                if let Err(e) = crate::video::cleanup(&it, it.status == DlStatus::Completed) { return self.toast("Couldn't delete video files", &e.to_string(), None); }
+            }
+        }
         self.st.lock().items.retain(|i| i.id != id);
         if it.is_torrent {
             // Unfinished torrents lose their partial data; finished files stay unless asked to delete them.
@@ -603,10 +783,10 @@ impl Manager {
             if !still_used && !it.torrent_file.is_empty() {
                 let _ = std::fs::remove_file(&it.torrent_file);
             }
-        } else {
+        } else if !it.is_video {
             let _ = std::fs::remove_file(it.part_path());
         }
-        if delete_file && it.status == DlStatus::Completed {
+        if delete_file && it.status == DlStatus::Completed && !it.is_video {
             win::recycle(&it.full_path());
         }
         self.save();
@@ -619,11 +799,21 @@ impl Manager {
         if it.is_torrent {
             self.torrents.remove(self, &it, true).await;
         }
+        if it.is_video {
+            if self.is_running(id) { return self.toast("Couldn't restart video", "The video process is still stopping. Try again shortly.", None); }
+            if let Err(e) = crate::video::cleanup(&it, false) {
+                self.toast("Couldn't restart video", &e.to_string(), None);
+                return;
+            }
+        }
         let _ = std::fs::remove_file(it.part_path());
         self.with_item(id, |it| {
             it.segments.lock().clear();
             it.downloaded = 0;
             it.retry_count = 0;
+            it.verification_pending = false;
+            it.video_files.clear();
+            it.video_work_folder.clear();
             it.error_message.clear();
             it.status = DlStatus::Paused;
         });
@@ -643,7 +833,7 @@ impl Manager {
                 }
             }
             if let Some(q) = st.queues.iter_mut().find(|q| q.name == name) {
-                q.started_any = false;
+                q.started_ids.clear();
                 q.running = true;
             }
         }
@@ -710,7 +900,6 @@ impl Manager {
                 let members = Self::queue_members(&st, &name);
                 let max = st.queues.iter().find(|q| q.name == name).map(|q| q.max_concurrent).unwrap_or(2);
                 let mut active = members.iter().filter(|id| running.contains(*id)).count() as i32;
-                let mut started = false;
                 for id in &members {
                     if active >= max {
                         break;
@@ -718,18 +907,15 @@ impl Manager {
                     let Some(it) = st.items.iter().find(|i| &i.id == id) else { continue };
                     if it.status == DlStatus::Queued && !running.contains(id) && it.not_before.is_none_or(|t| t <= now) {
                         to_start.push(id.clone());
-                        started = true;
                         active += 1;
                     }
                 }
                 let any_queued = members.iter().any(|id| st.items.iter().any(|i| &i.id == id && i.status == DlStatus::Queued));
+                let all_completed = Self::queue_completed(&st, &name);
                 if let Some(q) = st.queues.iter_mut().find(|q| q.name == name) {
-                    if started {
-                        q.started_any = true;
-                    }
                     if active == 0 && !any_queued {
                         q.running = false;
-                        if q.started_any {
+                        if all_completed {
                             finished.push(q.clone());
                         }
                     }
@@ -753,6 +939,11 @@ impl Manager {
             self.save();
             self.emit("countdown", json!({ "action": format!("{:?}", q.post_action), "force": q.force_shutdown, "queue": q.name }));
         }
+    }
+
+    fn queue_completed(st: &State, name: &str) -> bool {
+        let Some(q) = st.queues.iter().find(|q| q.name == name) else { return false };
+        !q.started_ids.is_empty() && st.items.iter().filter(|i| q.started_ids.contains(&i.id)).all(|i| i.status == DlStatus::Completed)
     }
 
     fn run_scheduler(self: &Arc<Self>) {
@@ -831,15 +1022,7 @@ impl Manager {
         let tick = self.tick_no.fetch_add(1, Ordering::Relaxed) + 1;
         let now = Instant::now();
         let settings = self.settings();
-        self.global_limiter.set(Self::effective_global_kbps(&settings) as i64 * 1024);
-        {
-            let st = self.st.lock();
-            for q in &st.queues {
-                if let Some(l) = self.queue_limiter(&q.name) {
-                    l.set(q.speed_limit_kbps as i64 * 1024);
-                }
-            }
-        }
+        self.refresh_limits();
         let elapsed = {
             let mut lt = self.last_tick.lock();
             let e = lt.map(|t| (now - t).as_secs_f64()).unwrap_or(0.0);
@@ -866,7 +1049,6 @@ impl Manager {
                 book.smooth = if book.smooth <= 0.0 { inst } else { book.smooth * 0.85 + inst * 0.15 };
                 let smooth = book.smooth;
                 drop(book);
-                run.limiter.set(it.speed_limit_kbps as i64 * 1024);
                 if it.status == DlStatus::Downloading {
                     let hint = run.total_hint.load(Ordering::Relaxed);
                     if run.kind == Kind::Video && hint > 0 {
@@ -890,23 +1072,13 @@ impl Manager {
                 if downloading {
                     total += smooth;
                 }
-                // yt-dlp fixes its limit at start: restart it when it changes a lot. Torrents take new
+                // yt-dlp fixes its limit at start: reconnect for substantial, infrequent changes. Torrents take new
                 // limits live (torrent.rs tick); restarting one would re-check its data on disk.
                 if run.kind == Kind::Video && !run.restart_requested.load(Ordering::Relaxed) {
                     let started = run.started_limit.load(Ordering::Relaxed);
                     if started >= 0 && run.active.load(Ordering::Relaxed) > 0 {
-                        let q = it.queue_name.clone();
-                        let global = self.global_limiter.get();
-                        let cur = {
-                            let mut best = 0i64;
-                            for v in [global, self.queue_limiter(&q).map(|l| l.get()).unwrap_or(0), run.limiter.get()] {
-                                if v > 0 && (best == 0 || v < best) {
-                                    best = v;
-                                }
-                            }
-                            best
-                        };
-                        let changed = cur != started && (cur == 0 || started == 0 || (cur - started).abs() > started / 10);
+                        let cur = run.limiter.get();
+                        let changed = video_budget_changed(started, cur, run.created_at.elapsed());
                         if changed {
                             run.restart_requested.store(true, Ordering::Relaxed);
                             restarts.push(run.id.clone());
@@ -1029,6 +1201,8 @@ impl Manager {
         let speed = *self.total_speed.lock();
         let summary = json!({
             "running": running.len(),
+            "seeding": st.items.iter().filter(|i| i.seeding).count(),
+            "upSpeedText": fmt::speed(st.items.iter().filter(|i| i.is_torrent).map(|i| i.upload_speed).sum()),
             "count": st.items.len(),
             "speed": speed,
             "speedText": fmt::speed(speed),
@@ -1059,7 +1233,7 @@ impl Item {
 /// One row of the list, as the window shows it.
 fn row_json(it: &Item, running: bool, s: &Settings) -> Value {
     let downloading = it.status == DlStatus::Downloading;
-    let active = it.is_active();
+    let active = it.is_active() || it.seeding;
     let eta = if downloading && it.speed > 1.0 && it.total_size > 0 { fmt::eta((it.total_size - it.downloaded) as f64 / it.speed) } else { String::new() };
     let progress_text = if it.status == DlStatus::Completed || it.total_size > 0 {
         format!("{:.1}%", it.progress())
@@ -1069,7 +1243,7 @@ fn row_json(it: &Item, running: bool, s: &Settings) -> Value {
         String::new()
     };
     let conn = if it.is_torrent {
-        if downloading { format!("{} peers", it.active_connections) } else { String::new() }
+        if active { format!("{} peers", it.connected_peers) } else { String::new() }
     } else if downloading {
         format!("{}/{}", it.active_connections, it.connections)
     } else {
@@ -1119,6 +1293,7 @@ fn row_json(it: &Item, running: bool, s: &Settings) -> Value {
         "added": it.added_at.format("%b %d %H:%M").to_string(),
         "addedTs": it.added_at.timestamp(),
         "torrent": it.is_torrent,
+        "seeding": it.seeding,
         "video": it.is_video,
         "resumable": it.resumable,
         "running": running,
@@ -1135,4 +1310,176 @@ fn row_json(it: &Item, running: bool, s: &Settings) -> Value {
         "cover": crate::covers::cover_url(it, s),
         "throttled": it.throttled,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_engines_share_global_and_queue_budgets_and_rebalance() {
+        let mgr = Manager::new();
+        let items: Vec<Item> = (0..4).map(|n| Item { id: n.to_string(), queue_name: if n < 3 { "q".into() } else { String::new() }, speed_limit_kbps: if n == 2 { 100 } else { 0 }, ..Default::default() }).collect();
+        {
+            let mut st = mgr.st.lock();
+            st.items = items.clone();
+            st.settings.global_speed_limit_kbps = 1200;
+            st.queues = vec![QueueDef { name: "q".into(), speed_limit_kbps: 600, ..Default::default() }];
+        }
+        for (it, kind) in items.iter().zip([Kind::Http, Kind::Torrent, Kind::Video, Kind::Video]) {
+            let mut run = Run::test_run(&it.id);
+            Arc::get_mut(&mut run).unwrap().kind = kind;
+            mgr.running.lock().insert(it.id.clone(), run);
+        }
+        mgr.refresh_limits();
+        let limits = || (0..4).filter_map(|n| mgr.run_of(&n.to_string()).map(|r| r.limiter.get() / 1024)).collect::<Vec<_>>();
+        assert_eq!(limits(), [250, 250, 100, 600]);
+        mgr.running.lock().remove("2");
+        mgr.refresh_limits();
+        assert_eq!(limits(), [300, 300, 600]);
+        mgr.st.lock().settings.global_speed_limit_kbps = 0;
+        mgr.refresh_limits();
+        assert_eq!(limits(), [300, 300, 0]);
+        assert_eq!(download_allocations(&[0; 10], &[0; 10], &[0], 1024), vec![102; 10]);
+        assert_eq!(download_allocations(&[0; 4], &[0; 4], &[1024], 0), vec![256; 4]);
+    }
+
+    #[test]
+    fn idle_torrent_returns_capacity_to_http_and_busy_consumers_split_evenly() {
+        let mgr = Manager::new();
+        mgr.st.lock().settings.global_speed_limit_kbps = 1024;
+        for (id, kind, speed) in [("http", Kind::Http, 1024.0 * 1024.0), ("torrent", Kind::Torrent, 0.0)] {
+            mgr.st.lock().items.push(Item { id: id.into(), ..Default::default() });
+            let mut run = Run::test_run(id);
+            Arc::get_mut(&mut run).unwrap().kind = kind;
+            *run.book.lock() = SpeedBook { smooth: speed, last_t: Some(Instant::now()), ..Default::default() };
+            mgr.running.lock().insert(id.into(), run);
+        }
+        mgr.refresh_limits();
+        assert_eq!(mgr.run_of("http").unwrap().limiter.get(), 1024 * 1024 - 4096);
+        assert_eq!(mgr.run_of("torrent").unwrap().limiter.get(), 4096);
+        mgr.run_of("torrent").unwrap().book.lock().smooth = 1024.0 * 1024.0;
+        mgr.refresh_limits();
+        assert_eq!(mgr.run_of("http").unwrap().limiter.get(), 512 * 1024);
+        assert_eq!(mgr.run_of("torrent").unwrap().limiter.get(), 512 * 1024);
+        assert_eq!(download_allocations(&[4096, 0, 0], &[0, 0, 1], &[512 * 1024, 0], 1024 * 1024), [4096, 512 * 1024 - 4096, 512 * 1024]);
+    }
+
+    #[test]
+    fn video_budget_reconnect_requires_large_change_and_cooldown() {
+        let ready = Duration::from_secs(60);
+        assert!(!video_budget_changed(1000, 1200, ready));
+        assert!(!video_budget_changed(1000, 700, ready));
+        assert!(!video_budget_changed(1000, 1600, Duration::from_secs(59)));
+        assert!(video_budget_changed(1000, 1600, ready));
+        assert!(video_budget_changed(1000, 0, ready));
+        assert!(video_budget_changed(0, 1000, ready));
+        assert!(!video_budget_changed(-1, 1000, ready));
+    }
+
+    #[test]
+    fn completed_seeding_rows_and_summary_include_upload_activity() {
+        let mgr = Manager::new();
+        let it = Item { is_torrent: true, status: DlStatus::Completed, seeding: true, upload_speed: 2048.0, connected_peers: 3, connected_seeds: 1, ..Default::default() };
+        let row = row_json(&it, false, &Settings::default());
+        assert_eq!(row["upSpeedText"], fmt::speed(2048.0));
+        assert_eq!(row["conn"], "3 peers");
+        assert!(!row["peers"].as_str().unwrap().is_empty());
+        mgr.st.lock().items.push(it);
+        let (_, _, summary) = mgr.snapshot();
+        assert_eq!(summary["seeding"], 1);
+        assert_eq!(summary["running"], 0);
+        assert_eq!(summary["upSpeedText"], fmt::speed(2048.0));
+    }
+
+    fn state(items: Vec<Item>) -> State {
+        State { items, queues: vec![QueueDef::default()], settings: Settings::default(), stats: StatsStore::default() }
+    }
+
+    #[test]
+    fn queue_only_finishes_when_every_remaining_started_item_completed() {
+        let done = Item { queue_name: "test".into(), status: DlStatus::Completed, ..Default::default() };
+        let old = Item { queue_name: "test".into(), status: DlStatus::Error, ..Default::default() };
+        let mut st = state(vec![done.clone(), old]);
+        st.queues[0].name = "test".into();
+        assert!(!Manager::queue_completed(&st, "test"));
+        st.queues[0].started_ids.insert(done.id.clone());
+        assert!(Manager::queue_completed(&st, "test"));
+        assert!(!Manager::queue_completed(&st, "empty"));
+        for status in [DlStatus::Paused, DlStatus::Error, DlStatus::Queued, DlStatus::Downloading, DlStatus::Verifying] {
+            st.items[0].status = status;
+            assert!(!Manager::queue_completed(&st, "test"));
+        }
+        st.items.remove(0);
+        assert!(Manager::queue_completed(&st, "test"));
+        st.items.clear();
+        let mgr = Manager::new();
+        *mgr.st.lock() = st;
+        mgr.start_queue("test");
+        assert!(mgr.st.lock().queues[0].started_ids.is_empty());
+    }
+
+    #[test]
+    fn resolved_duplicate_keeps_existing_item_in_every_status() {
+        let mgr = Manager::new();
+        for status in [DlStatus::Paused, DlStatus::Error, DlStatus::Queued, DlStatus::Completed, DlStatus::Downloading] {
+            let existing = Item { is_torrent: true, info_hash: "ABC123".into(), status, ..Default::default() };
+            let pending = Item { is_torrent: true, ..Default::default() };
+            mgr.st.lock().items = vec![existing.clone(), pending.clone()];
+            assert!(!mgr.claim_torrent_hash(&pending.id, "abc123"));
+            assert_eq!(mgr.st.lock().items.len(), 1);
+            assert_eq!(mgr.st.lock().items[0].id, existing.id);
+            assert_eq!(mgr.st.lock().items[0].status, status);
+        }
+    }
+
+    #[test]
+    fn update_restores_only_recorded_items_and_queue_state() {
+        let active = Item::default();
+        let queued = Item::default();
+        let paused = Item::default();
+        let mut st = state(vec![active.clone(), queued.clone(), paused.clone()]);
+        let name = st.queues[0].name.clone();
+        let snapshot = UpdateResume { items: vec![(active.id.clone(), DlStatus::Downloading), (queued.id.clone(), DlStatus::Queued)], queues: vec![(name, HashSet::from([active.id.clone()]))] };
+        let snapshot: UpdateResume = serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        assert_eq!(Manager::apply_update_resume(&mut st, &snapshot), vec![active.id.clone()]);
+        assert_eq!(st.items[1].status, DlStatus::Queued);
+        assert_eq!(st.items[2].status, DlStatus::Paused);
+        assert!(st.queues[0].running);
+        assert_eq!(st.queues[0].started_ids, HashSet::from([active.id]));
+        let mgr = Manager::new();
+        *mgr.st.lock() = st;
+        assert_eq!(mgr.update_resume().queues, snapshot.queues);
+    }
+
+    #[test]
+    fn updated_without_readable_resume_starts_launch_queues() {
+        let root = std::env::current_dir().unwrap().join("target").join(format!("startup-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("update-resume.json");
+        for corrupt in [false, true] {
+            if corrupt { std::fs::write(&path, b"invalid json").unwrap(); }
+            let mgr = Manager::new();
+            {
+                let mut st = mgr.st.lock();
+                *st = state(vec![]);
+                st.queues[0].start_on_launch = true;
+                let queue_name = st.queues[0].name.clone();
+                st.items.push(Item { queue_name, status: DlStatus::Queued, not_before: Some(Local::now() + chrono::Duration::hours(1)), ..Default::default() });
+            }
+            mgr.start_loaded(true, &path);
+            assert!(mgr.st.lock().queues[0].running);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_resume_record_is_consumed_once() {
+        let path = std::env::current_dir().unwrap().join("target").join(format!("update-test-{}.json", uuid::Uuid::new_v4()));
+        let resume = UpdateResume { items: vec![("running".into(), DlStatus::Downloading)], queues: vec![] };
+        std::fs::write(&path, serde_json::to_vec(&resume).unwrap()).unwrap();
+        assert_eq!(Manager::take_update_resume(&path).unwrap().items[0].0, "running");
+        assert!(!path.exists());
+        assert!(Manager::take_update_resume(&path).is_none());
+    }
 }

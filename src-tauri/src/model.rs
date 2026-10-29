@@ -4,7 +4,7 @@
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use parking_lot::Mutex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub const MAX_CONNECTIONS: i32 = 64;
@@ -151,8 +151,11 @@ pub struct Item {
     #[serde(with = "when_opt")]
     pub completed_at: Option<When>,
     pub resumable: bool,
+    pub http_validator: Option<String>,
+    pub http_validator_url: Option<String>,
     pub auto_name: bool,
     pub expected_hash: String,
+    pub verification_pending: bool,
     pub headers: String,
     pub retry_count: i32,
     pub mirrors: Vec<String>,
@@ -173,6 +176,8 @@ pub struct Item {
     pub upload_limit_kbps: i32,
     #[serde(rename = "SeedingLimitKBps")]
     pub seeding_limit_kbps: i32,
+    #[serde(skip)]
+    pub seeding: bool,
     pub extra_trackers: Vec<String>,
     pub total_uploaded: i64,
     pub active_seconds: f64,
@@ -191,6 +196,9 @@ pub struct Item {
     pub is_video: bool,
     pub video_format: String,
     pub video_playlist: bool,
+    /// Private staging folder and completed files owned by this video job.
+    pub video_work_folder: String,
+    pub video_files: Vec<String>,
 
     /// Saved copy of the live segment list (the live one is shared with the download's connections).
     #[serde(rename = "Segments")]
@@ -247,8 +255,11 @@ impl Default for Item {
             last_try: None,
             completed_at: None,
             resumable: false,
+            http_validator: None,
+            http_validator_url: None,
             auto_name: false,
             expected_hash: String::new(),
+            verification_pending: false,
             headers: String::new(),
             retry_count: 0,
             mirrors: vec![],
@@ -261,6 +272,7 @@ impl Default for Item {
             open_when_done: false,
             upload_limit_kbps: 0,
             seeding_limit_kbps: 0,
+            seeding: false,
             extra_trackers: vec![],
             total_uploaded: 0,
             active_seconds: 0.0,
@@ -273,6 +285,8 @@ impl Default for Item {
             is_video: false,
             video_format: "best".into(),
             video_playlist: false,
+            video_work_folder: String::new(),
+            video_files: vec![],
             saved_segments: vec![],
             segments: Arc::new(Mutex::new(vec![])),
             note: String::new(),
@@ -394,7 +408,7 @@ pub struct QueueDef {
     #[serde(skip)]
     pub running: bool,
     #[serde(skip)]
-    pub started_any: bool,
+    pub started_ids: HashSet<String>,
 }
 
 impl Default for QueueDef {
@@ -416,7 +430,7 @@ impl Default for QueueDef {
             last_start_fire: min_when(),
             last_stop_fire: min_when(),
             running: false,
-            started_any: false,
+            started_ids: HashSet::new(),
         }
     }
 }

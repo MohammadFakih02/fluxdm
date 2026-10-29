@@ -8,6 +8,42 @@ import { ext, isGecko, loadSettings, extSet, extOf, api } from "./common.js";
 
 const recent = new Map(); // url -> time, so a site firing the same download twice isn't sent twice
 
+// The downloads API omits the request method. Remember POST chains before a download exists,
+// including redirects that turn the final request into GET. Session storage survives worker suspension.
+const postRequests = new Set();
+const requestStore = ext.storage.session || ext.storage.local;
+let postWrites = Promise.resolve();
+function rememberPost(url, source = "") {
+  postWrites = postWrites.then(async () => {
+    const { postDownloads = {} } = await requestStore.get("postDownloads");
+    const now = Date.now();
+    for (const key of Object.keys(postDownloads)) if (now - postDownloads[key] > 30 * 60 * 1000) delete postDownloads[key];
+    if (source && !postDownloads[source]) return;
+    postDownloads[url] = now;
+    await requestStore.set({ postDownloads });
+  }).catch(() => {});
+}
+async function fromPost(...urls) {
+  await postWrites;
+  const { postDownloads = {} } = await requestStore.get("postDownloads");
+  return urls.some(url => Date.now() - (postDownloads[url] || 0) < 30 * 60 * 1000);
+}
+// Form downloads are frame navigations; watching only frames keeps background POSTs (analytics, chat) out of storage.
+const FRAMES = { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] };
+if (ext.webRequest) {
+  ext.webRequest.onBeforeRequest.addListener(d => {
+    if (d.method === "POST") postRequests.add(d.requestId);
+    if (postRequests.has(d.requestId)) rememberPost(d.url);
+  }, FRAMES);
+  ext.webRequest.onBeforeRedirect.addListener(d => {
+    if (d.method === "POST" || postRequests.has(d.requestId)) rememberPost(d.redirectUrl);
+    else rememberPost(d.redirectUrl, d.url); // Recover a chain after worker suspension.
+  }, FRAMES);
+  const forget = d => postRequests.delete(d.requestId);
+  ext.webRequest.onCompleted.addListener(forget, FRAMES);
+  ext.webRequest.onErrorOccurred.addListener(forget, FRAMES);
+}
+
 // Waterfox/Firefox report a download's *final* URL — often a signed CDN link (GitHub, Hugging Face…)
 // that expires within minutes. Remember redirect chains so FluxDM gets the original, stable link and
 // can obtain a fresh signed URL on every reconnect. (Chromium already reports the original in item.url.)
@@ -60,6 +96,7 @@ async function onHeaders(d) {
   if (!attachment && (contentType === "" || DISPLAYABLE.test(contentType))) return {};
 
   const url = redirectOrigin.get(d.url) || d.url;
+  if (await fromPost(url, d.url)) return {};
   const fileName = nameFromDisposition(cd) || nameFromUrl(d.url);
   const type = extOf(fileName) || extOf(url);
   const size = parseInt(header(d, "content-length"), 10) || 0;
@@ -150,6 +187,7 @@ async function capture(item) {
 
   const finalUrl = item.finalUrl || item.url;
   const url = redirectOrigin.get(item.url) || item.url;
+  if (await fromPost(url, item.url, finalUrl)) return;
   const { name, temporary } = realName(item);
   const label = (!temporary && name) || url.split(/[?#]/)[0].split("/").pop() || url;
 

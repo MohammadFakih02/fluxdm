@@ -5,7 +5,7 @@ use crate::manager::{Manager, Run};
 use crate::model::*;
 use crate::net::{self, DlError, DlResult, ErrKind};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -227,9 +227,15 @@ fn download_args(it: &Item, s: &Settings, limit_bps: i64) -> Vec<String> {
     add(&["--newline", "--progress", "--no-mtime", "--windows-filenames", "--no-warnings"]);
     add(&["--progress-template", "download:FLUXPROG %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s"]);
     add(&["--print", "after_move:FLUXFILE %(filepath)s"]);
-    add(&["-N", &it.connections.clamp(1, 16).to_string()]);
+    add(&["-N", &if limit_bps > 0 { 1 } else { it.connections.clamp(1, 16) }.to_string()]);
     if limit_bps > 0 {
-        add(&["--limit-rate", &format!("{}K", (limit_bps / 1024).max(1))]);
+        add(&["--limit-rate", &limit_bps.to_string()]);
+    }
+    for line in it.headers.lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("Referer") { add(&["--referer", value.trim()]); }
+            else if name.trim().eq_ignore_ascii_case("User-Agent") { add(&["--user-agent", value.trim()]); }
+        }
     }
     match it.video_format.as_str() {
         "audio-mp3" => add(&["-f", "ba/b", "-x", "--audio-format", "mp3", "--audio-quality", "0"]),
@@ -237,7 +243,7 @@ fn download_args(it: &Item, s: &Settings, limit_bps: i64) -> Vec<String> {
         h if h.parse::<i32>().is_ok() => add(&["-f", &format!("bv*[height<={h}]+ba/b[height<={h}]"), "-S", "res,ext:mp4:m4a", "--merge-output-format", "mp4"]),
         _ => add(&["-f", "bv*+ba/b", "--merge-output-format", "mp4/mkv"]),
     }
-    let folder = PathBuf::from(&it.save_folder);
+    let folder = PathBuf::from(&it.video_work_folder);
     if it.video_playlist {
         let out = folder.join("%(playlist_title).80B").join("%(playlist_index)03d - %(title).120B.%(ext)s");
         add(&["--yes-playlist", "-o", &out.to_string_lossy()]);
@@ -373,6 +379,49 @@ fn kill_tree(pid: u32) {
 
 use std::os::windows::process::CommandExt as _;
 
+/// All intermediate files live in one private job directory; final files are recorded individually.
+pub fn cleanup(it: &Item, recycle_outputs: bool) -> std::io::Result<()> {
+    let work = PathBuf::from(&it.video_work_folder);
+    if !it.video_work_folder.is_empty() && (!work.is_absolute() || work.file_name().and_then(|n| n.to_str()) != Some(&format!(".fluxdm-{}", it.id))) {
+        return Err(std::io::Error::other("Invalid video staging folder"));
+    }
+    for path in &it.video_files {
+        match remove_output(Path::new(path), recycle_outputs) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        if it.video_playlist {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+    if !it.video_work_folder.is_empty() {
+        match std::fs::remove_dir_all(work) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    } else if it.video_files.is_empty() && it.status == DlStatus::Completed {
+        // Older jobs only have their last completed file's path; other files have no ownership record.
+        match remove_output(Path::new(&it.full_path()), recycle_outputs) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn remove_output(path: &Path, recycle: bool) -> std::io::Result<()> {
+    if !recycle { return std::fs::remove_file(path); }
+    if !path.try_exists()? { return Ok(()); }
+    crate::win::recycle(&path.to_string_lossy());
+    if path.try_exists()? { return Err(std::io::Error::other("Couldn't move a video output to the Recycle Bin")); }
+    Ok(())
+}
+
 pub async fn run(mgr: Arc<Manager>, run: Arc<Run>) {
     let id = run.id.clone();
     let r = go(&mgr, &run).await;
@@ -411,10 +460,18 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>) -> DlResult<()> {
             _ = run.cancel.cancelled() => return Err(DlError::cancelled()),
         }
     }
+    mgr.with_item(&id, |it| {
+        if it.video_work_folder.is_empty() {
+            it.video_work_folder = PathBuf::from(&it.save_folder).join(format!(".fluxdm-{}", it.id)).to_string_lossy().into_owned();
+        }
+    });
+    // Save ownership before starting the child, so cleanup also works after an interrupted session.
+    mgr.save();
     let Some(it) = mgr.item(&id) else { return Ok(()) };
     std::fs::create_dir_all(&it.save_folder)?;
+    std::fs::create_dir_all(&it.video_work_folder)?;
     let s = mgr.settings();
-    let limit = mgr.effective_limit(run, &it.queue_name);
+    let limit = run.limiter.get();
     run.started_limit.store(limit, Ordering::Relaxed);
 
     let mut child = command(&download_args(&it, &s, limit)).spawn()?;
@@ -436,6 +493,7 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>) -> DlResult<()> {
             _ = run.cancel.cancelled() => {
                 kill_tree(pid);
                 let _ = child.kill().await;
+                let _ = child.wait().await;
                 return Err(DlError::cancelled());
             }
         }
@@ -445,24 +503,17 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>) -> DlResult<()> {
     }
     let status = tokio::select! {
         s = child.wait() => s?,
-        _ = run.cancel.cancelled() => { kill_tree(pid); return Err(DlError::cancelled()); }
+        _ = run.cancel.cancelled() => { kill_tree(pid); let _ = child.wait().await; return Err(DlError::cancelled()); }
     };
     run.active.store(0, Ordering::Relaxed);
     if !status.success() {
         let msg = if st.last_error.is_empty() { format!("yt-dlp failed (exit code {})", status.code().unwrap_or(-1)) } else { explain(&st.last_error) };
         return Err(DlError::transient(msg));
     }
-    let size = st.final_path.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len() as i64).unwrap_or(run.current.load(Ordering::Relaxed));
+    let (size, target) = publish_outputs(mgr, &it, &st.final_paths)?;
     mgr.with_item(&id, |it| {
-        if let Some(p) = &st.final_path {
-            let p = std::path::Path::new(p);
-            if let Some(dir) = p.parent() {
-                it.save_folder = dir.to_string_lossy().into_owned();
-            }
-            if let Some(n) = p.file_name() {
-                it.file_name = n.to_string_lossy().into_owned();
-            }
-        }
+        it.save_folder = target.parent().unwrap().to_string_lossy().into_owned();
+        it.file_name = target.file_name().unwrap().to_string_lossy().into_owned();
         it.total_size = size;
         it.downloaded = size;
         it.error_message.clear();
@@ -472,12 +523,36 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>) -> DlResult<()> {
     Ok(())
 }
 
+fn publish_outputs(mgr: &Manager, it: &Item, paths: &[String]) -> DlResult<(i64, PathBuf)> {
+    let work = PathBuf::from(&it.video_work_folder);
+    if paths.is_empty() { return Err(DlError::fatal("yt-dlp didn't report an output file")); }
+    let mut files = vec![];
+    for source in paths {
+        let source = PathBuf::from(source);
+        let relative = source.strip_prefix(&work).map_err(|_| DlError::fatal("Video output is outside its staging folder"))?;
+        if relative.components().any(|c| !matches!(c, std::path::Component::Normal(_))) { return Err(DlError::fatal("Invalid video output path")); }
+        let destination = PathBuf::from(&it.save_folder).join(relative);
+        let folder = destination.parent().ok_or_else(|| DlError::fatal("Invalid video output folder"))?;
+        std::fs::create_dir_all(folder)?;
+        let name = mgr.unique_name(&folder.to_string_lossy(), &destination.file_name().unwrap().to_string_lossy(), Some(&it.id), &[]);
+        let destination = folder.join(name);
+        std::fs::rename(&source, &destination)?;
+        mgr.with_item(&it.id, |it| it.video_files.push(destination.to_string_lossy().into_owned()));
+        mgr.save();
+        files.push(destination);
+    }
+    let size: i64 = files.iter().map(|p| std::fs::metadata(p).map(|m| m.len() as i64)).collect::<Result<Vec<_>, _>>()?.iter().sum();
+    let target = if it.video_playlist { files[0].parent().unwrap().to_path_buf() } else { files[0].clone() };
+    let _ = std::fs::remove_dir_all(&work);
+    Ok((size, target))
+}
+
 #[derive(Default)]
 struct Progress {
     finished: i64,
     current: i64,
     stream_started: bool,
-    final_path: Option<String>,
+    final_paths: Vec<String>,
     last_error: String,
 }
 
@@ -512,9 +587,131 @@ impl Progress {
                 run.total_hint.store(self.finished + t, Ordering::Relaxed);
             }
         } else if let Some(p) = line.strip_prefix("FLUXFILE ") {
-            self.final_path = Some(p.trim().to_string());
+            let path = p.trim().to_string();
+            if !self.final_paths.contains(&path) { self.final_paths.push(path); }
         } else if let Some(e) = line.strip_prefix("ERROR:") {
             self.last_error = e.trim().to_string();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn video() -> (PathBuf, Item) {
+        let root = std::env::current_dir().unwrap().join("target").join(format!("video-test-{}", uuid::Uuid::new_v4()));
+        let mut it = Item { is_video: true, save_folder: root.to_string_lossy().into_owned(), ..Default::default() };
+        it.video_work_folder = root.join(format!(".fluxdm-{}", it.id)).to_string_lossy().into_owned();
+        std::fs::create_dir_all(&it.video_work_folder).unwrap();
+        (root, it)
+    }
+
+    #[test]
+    fn cleanup_removes_job_fragments_and_outputs_but_keeps_other_files() {
+        let (root, mut it) = video();
+        for name in ["video.mp4.part", "video.mp4.ytdl", "video.mp4.part-Frag1", "video.f137.mp4", "video.mp4"] {
+            std::fs::write(PathBuf::from(&it.video_work_folder).join(name), b"partial").unwrap();
+        }
+        let output = root.join("finished.mp4");
+        std::fs::write(&output, b"output").unwrap();
+        std::fs::write(root.join("unrelated.mp4"), b"keep").unwrap();
+        it.video_files.push(output.to_string_lossy().into_owned());
+        let saved: Item = serde_json::from_str(&serde_json::to_string(&it).unwrap()).unwrap();
+        cleanup(&saved, false).unwrap();
+        cleanup(&saved, false).unwrap();
+        assert!(!PathBuf::from(&it.video_work_folder).exists());
+        assert!(!output.exists());
+        assert_eq!(std::fs::read(root.join("unrelated.mp4")).unwrap(), b"keep");
+        it.video_work_folder = root.to_string_lossy().into_owned();
+        assert!(cleanup(&it, false).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn playlist_outputs_sum_sizes_target_folder_and_keep_existing_files() {
+        let (root, mut it) = video();
+        it.video_playlist = true;
+        let staging = PathBuf::from(&it.video_work_folder).join("Playlist");
+        std::fs::create_dir_all(&staging).unwrap();
+        let mgr = Manager::new();
+        mgr.st.lock().items.push(it.clone());
+        let run = Run::test_run(&it.id);
+        let mut progress = Progress::default();
+        for (name, bytes) in [("one.mp4", "one"), ("two.mp4", "second")] {
+            let path = staging.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            progress.line(&format!("FLUXFILE {}", path.display()), &run);
+            progress.line(&format!("FLUXFILE {}", path.display()), &run);
+        }
+        assert_eq!(progress.final_paths.len(), 2);
+        let folder = root.join("Playlist");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("one.mp4"), b"existing").unwrap();
+        let (size, target) = publish_outputs(&mgr, &it, &progress.final_paths).unwrap();
+        assert_eq!(size, 9);
+        assert_eq!(target, folder);
+        let saved = mgr.item(&it.id).unwrap();
+        assert_eq!(saved.video_files.len(), 2);
+        assert!(saved.video_files.iter().all(|p| PathBuf::from(p).is_file()));
+        cleanup(&saved, false).unwrap();
+        assert_eq!(std::fs::read(folder.join("one.mp4")).unwrap(), b"existing");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn limited_video_uses_one_fragment_worker_and_its_exact_share() {
+        let it = Item { video_work_folder: "staging".into(), connections: 8, headers: "Referer: https://example.invalid/page\nUser-Agent: test-agent".into(), ..Default::default() };
+        let settings = Settings { video_cookies_browser: "none".into(), ..Default::default() };
+        let args = download_args(&it, &settings, 1536);
+        let value = |key: &str| args[args.iter().position(|a| a == key).unwrap() + 1].as_str();
+        assert_eq!(value("--limit-rate"), "1536");
+        assert_eq!(value("-N"), "1");
+        assert_eq!(value("--referer"), "https://example.invalid/page");
+        assert_eq!(value("--user-agent"), "test-agent");
+        let tiny = download_args(&it, &settings, 102);
+        assert_eq!(tiny[tiny.iter().position(|a| a == "--limit-rate").unwrap() + 1], "102");
+        let unlimited = download_args(&it, &settings, 0);
+        assert!(!unlimited.iter().any(|a| a == "--limit-rate"));
+        assert_eq!(unlimited[unlimited.iter().position(|a| a == "-N").unwrap() + 1], "8");
+    }
+
+    #[test]
+    fn legacy_cleanup_only_deletes_a_known_completed_file() {
+        let (root, mut it) = video();
+        std::fs::remove_dir(&it.video_work_folder).unwrap();
+        it.video_work_folder.clear();
+        it.file_name = "old.mp4".into();
+        let path = PathBuf::from(it.full_path());
+        std::fs::write(&path, b"keep while unowned").unwrap();
+        cleanup(&it, false).unwrap();
+        assert!(path.exists());
+        it.status = DlStatus::Completed;
+        cleanup(&it, false).unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_an_unfinished_video_cleans_staging_even_without_delete_files() {
+        let (root, it) = video();
+        std::fs::write(PathBuf::from(&it.video_work_folder).join("video.mp4.part"), b"partial").unwrap();
+        let mgr = Manager::new();
+        mgr.st.lock().items.push(it.clone());
+        mgr.remove(&it.id, false).await;
+        assert!(mgr.item(&it.id).is_none());
+        assert!(!PathBuf::from(&it.video_work_folder).exists());
+        std::fs::remove_dir_all(root).unwrap();
+
+        let (root, mut it) = video();
+        it.status = DlStatus::Completed;
+        let output = root.join("finished.mp4");
+        std::fs::write(&output, b"keep").unwrap();
+        it.video_files.push(output.to_string_lossy().into_owned());
+        mgr.st.lock().items.push(it.clone());
+        mgr.remove(&it.id, false).await;
+        assert!(mgr.item(&it.id).is_none());
+        assert_eq!(std::fs::read(output).unwrap(), b"keep");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
