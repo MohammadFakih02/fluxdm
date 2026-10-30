@@ -24,10 +24,29 @@ pub enum ErrKind {
     DiskFull,
     Cancelled,
     Changed,
+    Conflict,
+    NoResume,
     Other,
 }
 
+pub fn is_disk_full(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(39) | Some(112)) || e.kind() == std::io::ErrorKind::StorageFull
+}
+
 impl DlError {
+    pub fn disk_full(folder: &str) -> Self {
+        let drive = std::path::Path::new(folder).components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default();
+        let detail = crate::win::free_space(folder).map(|n| format!(" ({} free on {})", crate::model::fmt::size(n), drive)).unwrap_or_default();
+        Self { msg: format!("The disk is full{detail}. Free some space, then resume."), fatal: true, status: 0, kind: ErrKind::DiskFull }
+    }
+
+    pub fn apply_download_error(&self, it: &mut crate::model::Item) {
+        it.error_message = if self.kind == ErrKind::DiskFull { Self::disk_full(it.storage_folder()).msg } else { self.msg.clone() };
+        it.set_status(if matches!(self.kind, ErrKind::DiskFull | ErrKind::Changed | ErrKind::NoResume | ErrKind::Conflict) {
+            crate::model::DlStatus::Paused
+        } else { crate::model::DlStatus::Error });
+    }
+
     pub fn fatal(msg: impl Into<String>) -> Self {
         Self { msg: msg.into(), fatal: true, status: 0, kind: ErrKind::Other }
     }
@@ -44,7 +63,7 @@ impl DlError {
         match self.kind {
             ErrKind::Http | ErrKind::Other => !self.fatal && self.kind == ErrKind::Http,
             ErrKind::Network | ErrKind::Timeout | ErrKind::Io => !self.fatal,
-            ErrKind::DiskFull | ErrKind::Cancelled | ErrKind::Changed => false,
+            ErrKind::DiskFull | ErrKind::Cancelled | ErrKind::Changed | ErrKind::NoResume | ErrKind::Conflict => false,
         }
     }
 }
@@ -73,8 +92,11 @@ impl From<reqwest::Error> for DlError {
 impl From<std::io::Error> for DlError {
     fn from(e: std::io::Error) -> Self {
         // ERROR_HANDLE_DISK_FULL (39) / ERROR_DISK_FULL (112)
-        if matches!(e.raw_os_error(), Some(39) | Some(112)) || e.kind() == std::io::ErrorKind::StorageFull {
-            return Self { msg: "Disk is full".into(), fatal: true, status: 0, kind: ErrKind::DiskFull };
+        if is_disk_full(&e) {
+            return Self::disk_full("");
+        }
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            return Self { msg: "The destination already exists. Choose another name or folder before resuming.".into(), fatal: true, status: 0, kind: ErrKind::Conflict };
         }
         if e.kind() == std::io::ErrorKind::PermissionDenied {
             return Self { msg: "Windows denied access to the save folder".into(), fatal: true, status: 0, kind: ErrKind::Io };
@@ -88,24 +110,105 @@ pub type DlResult<T> = Result<T, DlError>;
 
 // ------------------------------------------------------------------ client
 
-fn build_client(redirects: bool) -> Client {
-    Client::builder()
+const LOCAL_PROXY_BYPASS: &str = "localhost,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,::1,fc00::/7,fe80::/10";
+
+fn system_proxy_for(server: &str, scheme: &str) -> Option<String> {
+    let endpoint = if server.contains('=') {
+        server.split(';').filter_map(|v| v.split_once('=')).find(|(key, _)| key.trim().eq_ignore_ascii_case(scheme))?.1.trim()
+    } else { server.trim() };
+    if endpoint.is_empty() { return None; }
+    Some(if endpoint.contains("://") { endpoint.to_string() } else { format!("http://{endpoint}") })
+}
+
+fn environment_proxy(bypass_local: bool) -> Option<reqwest::Proxy> {
+    let read = |key: &str| std::env::var(key).ok().or_else(|| std::env::var(key.to_lowercase()).ok()).filter(|v| !v.is_empty());
+    let http = read("HTTP_PROXY"); let https = read("HTTPS_PROXY"); let all = read("ALL_PROXY");
+    if http.is_none() && https.is_none() && all.is_none() { return None; }
+    let mut bypass = read("NO_PROXY").unwrap_or_default();
+    if bypass_local { bypass.push(','); bypass.push_str(LOCAL_PROXY_BYPASS); }
+    Some(reqwest::Proxy::custom(move |url| {
+        if bypass_local && url.host_str().is_some_and(|h| !h.contains('.') && !h.contains(':')) { return None; }
+        match url.scheme() { "http" => http.as_ref().or(all.as_ref()), "https" => https.as_ref().or(all.as_ref()), _ => None }.cloned()
+    }).no_proxy(reqwest::NoProxy::from_string(&bypass)))
+}
+
+fn windows_proxy(bypass_local: bool) -> Option<reqwest::Proxy> {
+    let key = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings").ok()?;
+    if key.get_value::<u32, _>("ProxyEnable").ok()? == 0 { return None; }
+    let server = key.get_value::<String, _>("ProxyServer").ok()?;
+    let overrides = key.get_value::<String, _>("ProxyOverride").unwrap_or_default();
+    let short_local = overrides.split(';').any(|v| v.trim() == "<local>");
+    let mut bypass = overrides.split(';').filter(|v| v.trim() != "<local>").collect::<Vec<_>>().join(",");
+    if bypass_local { bypass.push(','); bypass.push_str(LOCAL_PROXY_BYPASS); }
+    Some(reqwest::Proxy::custom(move |url| {
+        if (short_local || bypass_local) && url.host_str().is_some_and(|h| !h.contains('.') && !h.contains(':')) { return None; }
+        system_proxy_for(&server, url.scheme())
+    }).no_proxy(reqwest::NoProxy::from_string(&bypass)))
+}
+
+fn build_client(redirects: bool, settings: &crate::model::Settings) -> Result<Client, String> {
+    let mut builder = Client::builder();
+    match settings.proxy_mode.as_str() {
+        "None" => builder = builder.no_proxy(),
+        "System" => { if let Some(proxy) = environment_proxy(settings.proxy_bypass_local).or_else(|| windows_proxy(settings.proxy_bypass_local)) { builder = builder.proxy(proxy); } },
+        "HTTP" | "SOCKS5" => {
+            let endpoint = proxy_url(settings)?.ok_or("Proxy host is required")?;
+            let mut proxy = reqwest::Proxy::all(endpoint).map_err(|_| "Invalid proxy address")?;
+            if settings.proxy_bypass_local {
+                proxy = proxy.no_proxy(reqwest::NoProxy::from_string(LOCAL_PROXY_BYPASS));
+            }
+            builder = builder.no_proxy().proxy(proxy);
+        },
+        _ => return Err("Choose a valid proxy type".into()),
+    }
+    builder
         .redirect(if redirects { reqwest::redirect::Policy::limited(20) } else { reqwest::redirect::Policy::none() })
         .connect_timeout(Duration::from_secs(20))
         .pool_idle_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(64)
         .tcp_nodelay(true)
         .build()
-        .expect("http client")
+        .map_err(|_| "Could not configure the HTTP client".into())
 }
 
 /// Shared client. Redirects are followed on every request, so signed CDN links (Hugging Face, GitHub
 /// releases…) are re-issued fresh on each reconnect instead of expiring.
-pub static HTTP: LazyLock<Client> = LazyLock::new(|| build_client(true));
-static NO_REDIRECT: LazyLock<Client> = LazyLock::new(|| build_client(false));
+pub struct SharedHttp;
+pub static HTTP: SharedHttp = SharedHttp;
+static CLIENTS: LazyLock<parking_lot::RwLock<(Client, Client)>> = LazyLock::new(|| {
+    let s = crate::model::Settings::default();
+    parking_lot::RwLock::new((build_client(true, &s).expect("http client"), build_client(false, &s).expect("http client")))
+});
+impl SharedHttp {
+    pub fn get(&self, url: impl reqwest::IntoUrl) -> RequestBuilder { CLIENTS.read().0.get(url) }
+    pub fn post(&self, url: impl reqwest::IntoUrl) -> RequestBuilder { CLIENTS.read().0.post(url) }
+}
+pub fn configure_proxy(s: &crate::model::Settings) -> Result<(), String> {
+    let clients = (build_client(true, s)?, build_client(false, s)?);
+    *CLIENTS.write() = clients;
+    Ok(())
+}
+pub fn proxy_url(s: &crate::model::Settings) -> Result<Option<String>, String> {
+    if !matches!(s.proxy_mode.as_str(), "HTTP" | "SOCKS5") { return Ok(None); }
+    let host = s.proxy_host.trim();
+    if host.is_empty() || host.contains(['/', '@', '?', '#', '\\']) || s.proxy_port == 0 {
+        return Err("Enter a proxy host and a port from 1 to 65535".into());
+    }
+    let scheme = if s.proxy_mode == "SOCKS5" { "socks5h" } else { "http" };
+    let host = host.trim_matches(['[', ']']);
+    let host = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
+    let mut url = url::Url::parse(&format!("{scheme}://{host}:{}", s.proxy_port)).map_err(|_| "Invalid proxy host")?;
+    if url.host_str().is_none() { return Err("Invalid proxy host".into()); }
+    if !s.proxy_username.is_empty() {
+        url.set_username(&s.proxy_username).map_err(|_| "Invalid proxy login")?;
+        url.set_password(Some(&s.proxy_password)).map_err(|_| "Invalid proxy login")?;
+    }
+    Ok(Some(url.into()))
+}
 
 pub fn build(url: &str, headers: &str, ua: &str, range: Option<(i64, Option<i64>)>, method: Method) -> RequestBuilder {
-    build_with(&HTTP, url, headers, ua, range, method)
+    build_with(&CLIENTS.read().0, url, headers, ua, range, method)
 }
 
 fn build_with(client: &Client, url: &str, headers: &str, ua: &str, range: Option<(i64, Option<i64>)>, method: Method) -> RequestBuilder {
@@ -152,7 +255,7 @@ pub async fn get_scoped(source: &str, headers: &str, ua: &str) -> DlResult<Respo
 
 fn scoped_get(origin: &url::Url, current: &url::Url, headers: &str, ua: &str) -> RequestBuilder {
     let scoped = if current.origin() == origin.origin() { headers } else { "" };
-    build_with(&NO_REDIRECT, current.as_str(), scoped, ua, None, Method::GET)
+    build_with(&CLIENTS.read().1, current.as_str(), scoped, ua, None, Method::GET)
 }
 
 /// Turns an HTTP error status into a DlError with a plain-words message.
@@ -173,6 +276,17 @@ pub fn ensure_ok(resp: &Response) -> DlResult<()> {
     };
     let fatal = !matches!(code, 408 | 425 | 429) && code < 500;
     Err(DlError { msg, fatal, status: code, kind: ErrKind::Http })
+}
+
+/// Reject expiry and login pages before touching destination data.
+pub fn ensure_file(resp: &Response, file_name: &str) -> DlResult<()> {
+    let ext = std::path::Path::new(file_name).extension().and_then(|v| v.to_str()).unwrap_or("");
+    let mime = resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("")
+        .split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if matches!(mime.as_str(), "text/html" | "application/xhtml+xml") && !ext.eq_ignore_ascii_case("html") && !ext.eq_ignore_ascii_case("htm") {
+        return Err(DlError { msg: "The link returned a web page instead of the file (expired, or it needs a login). Refresh the link.".into(), fatal: true, status: 0, kind: ErrKind::Changed });
+    }
+    Ok(())
 }
 
 /// "bytes 0-99/1000" → (0, 99, Some(1000))
@@ -223,16 +337,25 @@ pub fn if_range(req: RequestBuilder, validator: Option<&str>) -> RequestBuilder 
 
 /// Asks for the first byte range to learn size, resumability and the real file name.
 pub async fn probe(url: &str, headers: &str, ua: &str, timeout_sec: i32) -> DlResult<Probe> {
+    probe_file(url, headers, ua, timeout_sec, &name_from_url(url, false).unwrap_or_default()).await
+}
+
+pub async fn probe_file(url: &str, headers: &str, ua: &str, timeout_sec: i32, file_name: &str) -> DlResult<Probe> {
     let fut = async {
         let sha = hugging_face_sha(url, headers, ua).await;
-        let resp = build(url, headers, ua, Some((0, None)), Method::GET).send().await?;
+        let (resp, fallback) = match build(url, headers, ua, Some((0, None)), Method::GET).send().await {
+            Ok(resp) => (resp, false),
+            Err(e) if reset_or_eof(&e) => (build(url, headers, ua, None, Method::GET).send().await?, true),
+            Err(e) => return Err(e.into()),
+        };
         ensure_ok(&resp)?;
+        ensure_file(&resp, file_name)?;
         let mut total = -1;
         let mut resumable = false;
         if resp.status() == StatusCode::PARTIAL_CONTENT {
             if let Some((_, _, Some(len))) = content_range(&resp) {
                 total = len;
-                resumable = true;
+                resumable = !fallback;
             }
         } else if let Some(cl) = resp.content_length() {
             total = cl as i64;
@@ -258,6 +381,18 @@ pub async fn probe(url: &str, headers: &str, ua: &str, timeout_sec: i32) -> DlRe
     }
 }
 
+fn reset_or_eof(e: &reqwest::Error) -> bool {
+    let mut source: &dyn std::error::Error = e;
+    loop {
+        if let Some(io) = source.downcast_ref::<std::io::Error>() {
+            if matches!(io.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::UnexpectedEof) { return true; }
+        }
+        let detail = source.to_string().to_ascii_lowercase();
+        if detail.contains("connection closed before message completed") || detail.contains("unexpected eof") { return true; }
+        match source.source() { Some(next) => source = next, None => return false }
+    }
+}
+
 /// Hugging Face publishes the SHA-256 of LFS files in X-Linked-Etag on the redirect response.
 async fn hugging_face_sha(url: &str, headers: &str, ua: &str) -> Option<String> {
     let u = url::Url::parse(url).ok()?;
@@ -265,7 +400,8 @@ async fn hugging_face_sha(url: &str, headers: &str, ua: &str) -> Option<String> 
     if host != "huggingface.co" && host != "hf.co" {
         return None;
     }
-    let resp = build_with(&NO_REDIRECT, url, headers, ua, None, Method::HEAD).send().await.ok()?;
+    let request = build_with(&CLIENTS.read().1, url, headers, ua, None, Method::HEAD);
+    let resp = request.send().await.ok()?;
     let v = resp.headers().get("x-linked-etag")?.to_str().ok()?.trim().to_string();
     let v = v.strip_prefix("W/").unwrap_or(&v).trim_matches('"').to_lowercase();
     (v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit())).then_some(v)
@@ -452,6 +588,58 @@ mod tests {
             }
             assert_eq!(req.method(), Method::GET);
         }
+    }
+
+    #[test]
+    fn system_proxy_rules_choose_protocol_and_preserve_bypass_defaults() {
+        assert_eq!(system_proxy_for("http=one.invalid:80;https=two.invalid:443", "https").as_deref(), Some("http://two.invalid:443"));
+        assert_eq!(system_proxy_for("proxy.invalid:8080", "https").as_deref(), Some("http://proxy.invalid:8080"));
+        assert_eq!(system_proxy_for("http=one.invalid:80", "https"), None);
+        assert_eq!(system_proxy_for("", "http"), None);
+        assert!(!crate::model::Settings::default().proxy_bypass_local);
+    }
+
+    #[test]
+    fn proxy_settings_validate_hosts_and_escape_login_without_leaking_it() {
+        let mut s = crate::model::Settings { proxy_mode: "SOCKS5".into(), proxy_host: "::1".into(), proxy_port: 1080,
+            proxy_username: "a@b".into(), proxy_password: "p:/@ word".into(), ..Default::default() };
+        let endpoint = proxy_url(&s).unwrap().unwrap();
+        assert!(endpoint.starts_with("socks5h://a%40b:")); assert!(endpoint.contains("@[::1]:1080"));
+        assert!(build_client(true, &s).is_ok());
+        for bad in ["", "host/path", "name@host", "host:80", "host?x", "host#x"] {
+            s.proxy_host = bad.into(); assert!(proxy_url(&s).is_err(), "{bad}");
+        }
+        s.proxy_host = "example.invalid".into(); s.proxy_port = 0; assert!(proxy_url(&s).is_err());
+        s.proxy_mode = "None".into(); assert_eq!(proxy_url(&s).unwrap(), None);
+        s.proxy_mode = "invalid".into(); assert!(build_client(true, &s).is_err());
+    }
+
+    #[tokio::test]
+    async fn custom_http_proxy_routes_requests_and_bypasses_local_addresses() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut all = Vec::new();
+            loop { let mut buf = [0; 1024]; let n = stream.read(&mut buf).await.unwrap(); if n == 0 { break; }
+                all.extend_from_slice(&buf[..n]); if all.windows(4).any(|v| v == b"\r\n\r\n") { break; } }
+            let request = String::from_utf8(all).unwrap();
+            assert!(request.starts_with("GET http://example.invalid/file"));
+            assert!(request.to_lowercase().contains("proxy-authorization: basic "));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nproxy").await.unwrap();
+        });
+        let mut s = crate::model::Settings { proxy_mode: "HTTP".into(), proxy_host: "127.0.0.1".into(), proxy_port: port,
+            proxy_username: "name".into(), proxy_password: "secret".into(), ..Default::default() };
+        let response = build_client(true, &s).unwrap().get("http://example.invalid/file").send().await.unwrap();
+        assert_eq!(response.text().await.unwrap(), "proxy"); task.await.unwrap();
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(); let addr = local.local_addr().unwrap();
+        let task = tokio::spawn(async move { let (mut stream, _) = local.accept().await.unwrap(); let mut b = [0; 4096];
+            let n = stream.read(&mut b).await.unwrap(); assert!(!String::from_utf8_lossy(&b[..n]).contains("secret"));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect").await.unwrap(); });
+        s.proxy_bypass_local = true;
+        let response = build_client(true, &s).unwrap().get(format!("http://{addr}/")).send().await.unwrap();
+        assert_eq!(response.text().await.unwrap(), "direct"); task.await.unwrap();
     }
 
     #[test]

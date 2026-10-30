@@ -63,7 +63,16 @@ WebView2 if it's missing.
    command line, the phone remote, or the Add button.
 2. The **Add window** reads the link: file name, size, and whether it's a torrent or a video page.
 3. The manager puts the download in a queue. The queue decides when it starts, and the limits decide how fast
-   it runs.
+   it runs. Non-queue downloads share Settings > Downloads > Manual downloads at the same time (default 3),
+   across HTTP, video and torrents. Waiting entries remain Queued and can be paused.
+   Scheduler queues can stop when empty (default) or remain enabled for later additions. Retries are per queue
+   with a count (0 = off for new queues) and delay in seconds; saved legacy retry counts migrate to existing queues.
+   Scheduled starts use the current local-date slot, including overnight windows, and fire once per slot.
+   Without a stop time, a slot lasts until the following start time. Sleep past a stop time stops a running queue.
+   The Scheduler lists each queue with its live status, next start and item count. Its editor orders Name, When,
+   Limits, finish actions and Items; use Every day / Weekdays / Weekends or choose a one-off date. The schedule
+   summary updates as you edit. Move items up/down/top/bottom or drag them to change their queue order; Remove
+   and Clear queue only detach items from the queue, keeping downloads and files. Start/Stop follows live state.
 4. One of three engines downloads it:
    - **Files:** up to 64 connections each write their own part directly into the file. Progress is saved
      continuously, so a crash or reboot resumes where it stopped. When a connection finishes early, it takes
@@ -71,7 +80,7 @@ WebView2 if it's missing.
    - **Videos:** yt-dlp downloads and ffmpeg merges. Both are fetched once, on first use.
    - **Torrents:** librqbit, with FluxDM's patches.
 5. When it finishes, FluxDM can check the checksum, show a toast and run the queue's end action (sleep,
-   shutdown and so on, after a 60 s countdown you can cancel).
+   shutdown and so on, after a 60 s countdown you can cancel). Finish actions are skipped while other downloads are active or waiting, including downloads started during the countdown. Queues ending with failures report the failed count and never run a finish action.
 
 ## 4. The browser extension
 
@@ -175,6 +184,7 @@ be a much bigger job, its crates were copied into `src-tauri/vendor/` and patche
 - **Trackers tab:** tier, status, seeds, leeches and message for each tracker.
 - **Peers tab:** progress, per-peer speeds and flags; Seeds and Peers columns as "connected (swarm total)".
 - **File priorities:** Don't download / Low / Normal / High / Maximum.
+- **Unwanted-file storage:** byte ranges of unticked files use torrent-global offsets in `.fluxdm.parts/<info-hash>`. The folder is hidden on Windows; one sparse file per torrent prevents collisions in shared output folders. Selection changes migrate bytes before changing routing, uploads read boundary bytes there, and removal cleans up that torrent's file. Rechecks and moves detach without deleting retained bytes.
 - **Read-only finished files:** other programs can open finished files while FluxDM seeds them.
 - **Hole-punching (BEP 55):** reaches peers behind CGNAT/double NAT through a peer you both know.
 - **Availability column:** turns red below 1.00, meaning some piece isn't on any connected peer.
@@ -246,8 +256,33 @@ a different bridge port in its `settings.json` (`LocalApiPort`, for example `178
 | A torrent's file is "in use" | Finished files are held read-only, so other programs can open them. To edit, move or delete one yourself, remove the torrent from FluxDM first. |
 | Magnet links still open another app | Windows keeps its own default above FluxDM's registry entry. Use Settings → Torrents → *Make FluxDM the magnet handler*; it opens Default apps, where you choose FluxDM for MAGNET. |
 | Magnet links keep opening FluxDM after *Give magnet links back* | FluxDM was picked in Windows' Default apps, which outranks the registry entry FluxDM restores. FluxDM opens Default apps for you: choose another app for MAGNET there. |
-| A finished torrent no longer shares | Right-click → *Resume sharing*. It shares until the seed ratio; it refuses (and says why in the status) when the ratio is reached, the seeding limit is *No upload*, or files were moved or deleted (*Force recheck* fetches what's missing). |
+| A finished torrent no longer shares | Right-click → *Resume sharing*. It shares until the seed ratio or optional seeding time limit; it refuses (and says why in the status) when either target is reached, the seeding limit is *No upload*, or files were moved or deleted (*Force recheck* fetches what's missing). |
 | The window is blank (white or black) | Tray icon → *Reload window*. FluxDM also repaints a freshly shown window and nudges one that goes quiet. Details are in `src-tauri/src/webview_guard.rs`. |
 | A toast pulled me out of my game | Toasts are shown without taking focus (the window is non-focusable, and if the webview still grabs focus FluxDM gives the foreground back to the previous window within about 0.7 s). Each shows for about 6 s (longer while the mouse is on it, at most 15 s); if the page ever stops answering, FluxDM hides it after 25 s. Exclusive-fullscreen games can't show any overlay. Clicking a toast opens FluxDM on purpose. |
 | Set location on a half-finished torrent is slow | Unfinished torrents have full-size placeholder files. Across drives FluxDM offers to delete them and start over in the new folder instead of copying. |
 | Something crashed | Check `%APPDATA%\FluxDM\error.log`. |
+
+## Download storage, proxies and scheduled days
+
+Settings > Downloads offers Ask, Add a number (default), Overwrite and Skip for regular file downloads. Ask pauses with a choice; Skip leaves the existing file and any partial data untouched. A paused file's menu can reopen the choice. Torrents continue verifying existing files, and video tools retain their own collision handling.
+
+The optional unfinished folder applies to new HTTP and torrent items. Each item retains its own saved staging location even if this setting changes. HTTP partial files and torrent data stay there until completion, then move to the final destination. Same-volume moves use rename; cross-volume moves copy before removing originals. Destination conflicts preserve unfinished torrent data and report the problem. File views, rechecks, removal and Set location use the saved staging location.
+
+Proxy choices are None, System, HTTP and SOCKS5, with host, port, optional login and local-address bypass. System uses proxy environment variables or Windows' manual proxy settings, including exclusions; PAC scripts are unsupported. HTTP downloads, metadata and artwork share the setting. SOCKS5 routes outgoing torrent TCP peers and disables uTP; DHT and UDP trackers still connect directly. Restart FluxDM after changing torrent proxy settings. Login passwords are masked in Settings and saved with other settings.
+
+Settings > Speed schedule has weekday checkboxes. All days remain selected by default; an overnight window belongs to its selected starting day. Selecting no days disables the window without changing the normal limit.
+
+
+### Torrent defaults
+Settings > Torrents includes a seeding time limit (minutes, 0 = off) and a limit action: Stop sharing or Remove torrent (keep files). Either the ratio or time target ends sharing; ratio 0 still stops immediately. Sharing time is saved across restarts and excludes paused/checking time and long suspend gaps.
+
+The tracker list, filename exclusions and unfinished-file marking apply to new entries. Tracker URLs use HTTP, HTTPS or UDP, one per line; existing trackers are retained. Filename patterns such as `*.txt`, `*.url` and `*sample*` are case-insensitive and match filenames, without directory names or storage markers. `?` matches one character. Matching files start unticked in Add; select them there or in Files to override the default. Deferred/bulk additions use the defaults captured when added.
+
+Optional `.!fx` markers remain on unfinished files across pause, restart and moves, then disappear individually as each file completes. The original names stay in metadata and filters. For a maximum-length filename, only its temporary marker name is shortened to fit Windows; the completed name is retained. Ambiguous marker names are rejected before files open. A destination conflict or locked file reports an error and retains partial data; resolve it and resume.
+
+### Watching torrents and filtering peers
+Settings > Torrents can watch one folder for .torrent files. Imports wait at least four seconds without a size or modification-time change, use the normal default destination (including the Torrents category subfolder when enabled), and start through the normal concurrency limits. Metadata is cached and the list saved before the source moves into added. Existing archive names are preserved; subfolders and symlinks are ignored. Invalid, unreadable or unarchivable sources stay in place with a warning. Replace a failed source, or restart watching after fixing permissions, to retry. Clear the setting to disable watching.
+
+The optional IP blocklist accepts an HTTP(S) URL, an absolute local file path or a file URL. Use PeerGuardian name:start-end ranges in plain text or gzip. It loads when the torrent engine starts and reloads weekly while running. Failed/empty reloads preserve the previous ranges; an initial failure prevents the engine from starting and reports the reason. Updated ranges filter new peer connections; existing connections continue. Clear the setting and restart to disable it.
+
+DHT and local peer discovery default to enabled; IPv4 only defaults to off. These controls and blocklist changes require restarting FluxDM. Windows network-interface binding remains unavailable.

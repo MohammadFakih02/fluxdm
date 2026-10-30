@@ -1,36 +1,9 @@
-﻿<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>FluxDM</title>
-<link rel="stylesheet" href="style.css">
-<style>
-  html, body { background: transparent; }
-  #t {
-    position: fixed; inset: 0; display: flex; gap: 12px; align-items: flex-start; padding: 14px 14px 12px 16px;
-    background: var(--panel); border: 1px solid var(--line-strong); border-radius: 0; cursor: default; overflow: hidden;
-  }
-  #t:hover { background: var(--panel-2); }
-  #logo { width: 30px; height: 30px; flex: none; border-radius: 7px; margin-top: 1px; }
-  #title { font-weight: 600; margin-bottom: 2px; }
-  #body { color: var(--text-2); font-size: 12.5px; white-space: pre-line; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
-  #x { position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; padding: 0; border: 0; background: transparent; color: var(--text-3); }
-  #x:hover { background: var(--hover); color: var(--text); }
-  #x svg { width: 12px; height: 12px; }
-  #timer { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--accent); width: 100%; transform-origin: left; }
-</style>
-</head>
-<body>
-<div id="t">
-  <img id="logo" src="icon.png" alt="">
-  <div class="grow">
-    <div id="title"></div>
-    <div id="body"></div>
-  </div>
-  <button id="x" title="Dismiss"></button>
-  <div id="timer"></div>
-</div>
-<script src="common.js"></script>
-<script src="toast.js"></script>
-</body>
-</html>
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>FluxDM</title>
+<link rel="stylesheet" href="style.css"><link rel="stylesheet" href="toast.css"></head>
+<body><article id="t" role="status">
+<div id="toastArt" aria-hidden="true"></div><div id="toastWatermark" aria-hidden="true"></div>
+<div class="toast-content"><div class="toast-row"><div id="logo"></div><div class="grow"><div id="title"></div><div id="body"></div></div></div>
+<div id="countdownTrack" hidden><div id="countdownBar"></div></div><div id="actions"></div></div>
+<button id="x" title="Dismiss" aria-label="Dismiss"></button><div id="timer"></div>
+</article><script src="common.js"></script><script src="toast.js"></script></body></html>

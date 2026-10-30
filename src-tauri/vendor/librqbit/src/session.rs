@@ -112,6 +112,8 @@ pub struct Session {
     spawner: BlockingSpawner,
 
     // Network
+    // FluxDM patch: wake discovery and every tracker independently.
+    force_announces: parking_lot::Mutex<std::collections::HashMap<Id20, tokio::sync::watch::Sender<u64>>>,
     peer_id: Id20,
     announce_port: Option<u16>,
     listen_addr: Option<SocketAddr>,
@@ -138,7 +140,7 @@ pub struct Session {
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
     pub ratelimits: Limits,
 
-    pub blocklist: IpRanges,
+    pub blocklist: RwLock<IpRanges>,
     pub allowlist: Option<IpRanges>,
 
     // Monitoring / tracing / logging
@@ -179,7 +181,7 @@ fn compute_only_files_regex<ByteBuf: AsRef<[u8]>>(
     let filename_re = regex::Regex::new(filename_re).context("filename regex is incorrect")?;
     let mut only_files = Vec::new();
     for (idx, fd) in torrent.iter_file_details().enumerate() {
-        let full_path = fd.filename.to_pathbuf();
+        let full_path = crate::safe_path::path(fd.filename.iter_components());
         if filename_re.is_match(full_path.to_str().unwrap()) {
             only_files.push(idx);
         }
@@ -433,6 +435,8 @@ pub struct SessionOptions {
     /// Turn on to dump session contents into a file periodically, so that on next start
     /// all remembered torrents will continue where they left off.
     pub persistence: Option<SessionPersistenceConfig>,
+    // FluxDM patch: the application starts remembered torrents after checking their disk paths.
+    pub defer_persistence_restore: bool,
 
     /// The peer ID to use. If not specified, a random one will be generated.
     pub peer_id: Option<Id20>,
@@ -489,6 +493,7 @@ impl Default for SessionOptions {
             disable_trackers: false,
             fastresume: false,
             persistence: None,
+            defer_persistence_restore: false,
             peer_id: None,
             listen: None,
             connect: None,
@@ -694,7 +699,7 @@ impl Session {
             let proxy_config = match proxy_url {
                 Some(pu) => Some(
                     SocksProxyConfig::parse(pu)
-                        .with_context(|| format!("error parsing proxy url {pu}"))?,
+                        .context("error parsing proxy URL")?,
                 ),
                 None => None,
             };
@@ -705,9 +710,13 @@ impl Session {
 
             let reqwest_client = {
                 let builder = if let Some(proxy_url) = proxy_url {
-                    let proxy = reqwest::Proxy::all(proxy_url)
+                    let mut proxy = reqwest::Proxy::all(proxy_url)
                         .context("error creating socks5 proxy for HTTP")?;
-                    reqwest::Client::builder().proxy(proxy)
+                    // FluxDM patch: apply local bypass to HTTP trackers too.
+                    if opts.connect.as_ref().is_some_and(|c| c.proxy_bypass_local) {
+                        proxy = proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,::1,fc00::/7,fe80::/10"));
+                    }
+                    reqwest::Client::builder().no_proxy().proxy(proxy)
                 } else {
                     #[allow(unused_mut)]
                     let mut b = reqwest::Client::builder();
@@ -728,6 +737,7 @@ impl Session {
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
                     socks_proxy_config: proxy_config,
+                    proxy_bypass_local: opts.connect.as_ref().is_some_and(|c| c.proxy_bypass_local),
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
@@ -736,7 +746,7 @@ impl Session {
                 .context("error creating stream connector")?,
             );
 
-            let blocklist = if let Some(blocklist_url) = opts.blocklist_url {
+            let blocklist = if let Some(blocklist_url) = opts.blocklist_url.as_ref() {
                 info!(url = blocklist_url, "loading p2p blocklist");
                 let bl = IpRanges::load_from_url(&blocklist_url)
                     .await
@@ -781,6 +791,7 @@ impl Session {
                 persistence,
                 bitv_factory,
                 peer_id,
+                force_announces: Default::default(),
                 dht,
                 peer_opts,
                 spawner: spawner.clone(),
@@ -809,11 +820,23 @@ impl Session {
 
                 #[cfg(feature = "disable-upload")]
                 _disable_upload: opts.disable_upload,
-                blocklist,
+                blocklist: RwLock::new(blocklist),
                 allowlist,
                 lsd,
             });
 
+            if let Some(source) = opts.blocklist_url {
+                let weak = Arc::downgrade(&session);
+                session.spawn(debug_span!("blocklist_refresh"), "blocklist_refresh", async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(7 * 24 * 60 * 60)).await;
+                        let Some(session) = weak.upgrade() else { return Ok(()); };
+                        if let Err(e) = session.reload_blocklist(&source).await {
+                            warn!(error = %e, "blocklist refresh failed; retaining previous ranges");
+                        }
+                    }
+                });
+            }
             if let Some(mut listen) = listen_result {
                 if let Some(tcp) = listen.tcp_socket.take() {
                     let max_pending_incoming_handshake_checks =
@@ -880,6 +903,11 @@ impl Session {
                             match st {
                                 Some(st) => {
                                     let (id, st) = st?;
+                                    // FluxDM patch: retain persisted IDs without opening or checking files.
+                                    if opts.defer_persistence_restore {
+                                        session.next_id.fetch_max(id + 1, Ordering::Relaxed);
+                                        continue;
+                                    }
                                     let span = add_torrent_span(st.info_hash());
                                     let (add_torrent, mut opts) = st.into_add_torrent()?;
                                     opts.preferred_id = Some(id);
@@ -914,7 +942,7 @@ impl Session {
             .unwrap_or_else(|| Duration::from_secs(10));
 
         let incoming_ip = addr.ip();
-        if self.blocklist.has(incoming_ip) {
+        if self.blocklist.read().has(incoming_ip) {
             self.stats
                 .counters
                 .blocked_incoming
@@ -1064,8 +1092,9 @@ impl Session {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        // FluxDM patch: persist paused intent and flush resume data before shutting down.
         for torrent in torrents {
-            if let Err(e) = torrent.pause() {
+            if let Err(e) = self.pause(&torrent).await {
                 debug!("error pausing torrent: {e:#}");
             }
         }
@@ -1110,6 +1139,7 @@ impl Session {
                         trackers: magnet
                             .trackers
                             .into_iter()
+                            .chain(opts.trackers.clone().unwrap_or_default())
                             .filter_map(|t| url::Url::parse(&t).ok())
                             .collect(),
                         metadata: None,
@@ -1179,7 +1209,7 @@ impl Session {
     ) -> anyhow::Result<Option<PathBuf>> {
         let files = info
             .iter_file_details()
-            .map(|fd| Ok((fd.filename.to_pathbuf(), fd.len)))
+            .map(|fd| Ok((crate::safe_path::path(fd.filename.iter_components()), fd.len)))
             .collect::<anyhow::Result<Vec<(PathBuf, u64)>>>()?;
         if files.len() < 2 {
             return Ok(None);
@@ -1195,12 +1225,12 @@ impl Session {
         if let Some(name) = info.name()
             && !name.is_empty()
         {
-            let pb = PathBuf::from(name.as_ref());
+            let pb = PathBuf::from(crate::safe_path::component(name.as_ref()));
             check_valid(&pb)?;
             return Ok(Some(pb));
         };
         if let Some(name) = magnet_name {
-            let pb = PathBuf::from(name);
+            let pb = PathBuf::from(crate::safe_path::component(name));
             check_valid(&pb)?;
             return Ok(Some(pb));
         }
@@ -1370,7 +1400,7 @@ impl Session {
                 metadata.clone(),
                 only_files.clone(),
                 self.spawner
-                    .block_in_place(|| minfo.storage_factory.create_and_init(&minfo, &metadata))?,
+                    .block_in_place(|| minfo.storage_factory.create_and_init_selected(&minfo, &metadata, only_files.as_deref()))?,
                 false,
             ));
             let handle = Arc::new(ManagedTorrent {
@@ -1423,6 +1453,15 @@ impl Session {
     }
 
     pub async fn delete(&self, id: TorrentIdOrHash, delete_files: bool) -> anyhow::Result<()> {
+        self.delete_inner(id, delete_files, false).await
+    }
+
+    // FluxDM patch: rechecks and location/tracker changes retain boundary data.
+    pub async fn detach(&self, id: TorrentIdOrHash) -> anyhow::Result<()> {
+        self.delete_inner(id, false, true).await
+    }
+
+    async fn delete_inner(&self, id: TorrentIdOrHash, delete_files: bool, keep_parts: bool) -> anyhow::Result<()> {
         let id = match id {
             TorrentIdOrHash::Id(id) => id,
             TorrentIdOrHash::Hash(h) => self
@@ -1486,6 +1525,9 @@ impl Session {
             }
         }
 
+        if !keep_parts {
+            storage.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?.remove_partfile()?;
+        }
         match (storage, delete_files) {
             (Err(e), true) => return Err(e).context("torrent deleted, but could not delete files"),
             (Ok(storage), true) => {
@@ -1507,6 +1549,23 @@ impl Session {
         };
 
         info!(id, "deleted torrent");
+        Ok(())
+    }
+
+    // FluxDM patch: manual requests bypass the automatic announce interval.
+    pub(crate) fn force_announce(&self, hash: Id20) {
+        if let Some(wake) = self.force_announces.lock().get(&hash) {
+            wake.send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+    }
+
+    // FluxDM patch: moving unchanged bytes keeps their verified bitfield.
+    pub async fn detach_for_move(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        if !handle.is_paused() { self.pause(handle).await?; }
+        let bits = handle.with_chunk_tracker(|c| c.get_have_pieces().as_slice().to_owned().into_boxed_bitslice())?;
+        let hash = handle.info_hash();
+        self.detach(hash.into()).await?;
+        self.bitv_factory.store_initial_check(hash.into(), bits).await?;
         Ok(())
     }
 
@@ -1536,20 +1595,29 @@ impl Session {
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
     ) -> Option<PeerStream> {
-        let dht_rx = if is_private {
-            None
-        } else {
-            self.dht.as_ref().map(|dht| {
-                dht.get_peers(info_hash, if announce { self.announce_port } else { None })
-            })
-        };
-
-        let lsd_rx = if is_private {
-            None
-        } else {
-            self.lsd.as_ref().map(|lsd| {
-                lsd.announce(info_hash, if announce { self.announce_port } else { None })
-            })
+        // FluxDM patch: refresh discovery without touching storage or connected peers.
+        let wake = self.force_announces.lock().entry(info_hash)
+            .or_insert_with(|| tokio::sync::watch::channel(0).0).clone();
+        let mut discovery_wake = wake.subscribe();
+        let session = self.clone();
+        let discovery_rx: Option<PeerStream> = if is_private || (self.dht.is_none() && self.lsd.is_none()) { None } else {
+            Some(Box::pin(async_stream::stream! {
+                loop {
+                    discovery_wake.borrow_and_update();
+                    let port = if announce { session.announce_port } else { None };
+                    let dht = session.dht.as_ref().map(|d| d.get_peers(info_hash, port));
+                    let lsd = session.lsd.as_ref().map(|l| l.announce(info_hash, port));
+                    let mut peers = merge_two_optional_streams(dht, lsd);
+                    loop {
+                        tokio::select! {
+                            _ = discovery_wake.changed() => break,
+                            peer = async { peers.as_mut().unwrap().next().await }, if peers.is_some() => {
+                                match peer { Some(peer) => yield peer, None => peers = None }
+                            }
+                        }
+                    }
+                }
+            }))
         };
 
         if self.disable_trackers {
@@ -1579,6 +1647,7 @@ impl Session {
             self.announce_port().unwrap_or(4240),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
+            wake.subscribe(),
         );
 
         let initial_peers_rx = if initial_peers.is_empty() {
@@ -1587,11 +1656,7 @@ impl Session {
             Some(futures::stream::iter(initial_peers))
         };
         merge_two_optional_streams(
-            merge_two_optional_streams(
-                merge_two_optional_streams(dht_rx, tracker_rx),
-                initial_peers_rx,
-            ),
-            lsd_rx,
+            merge_two_optional_streams(discovery_rx, tracker_rx), initial_peers_rx,
         )
     }
 
@@ -1604,7 +1669,19 @@ impl Session {
     }
 
     pub async fn pause(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        // FluxDM patch: keep the previous live state until its sockets and callbacks stop.
+        let live = handle.live();
+        if let Some(live) = live { live.wait_for_paused_tasks().await; }
         handle.pause()?;
+        // FluxDM patch: a completed pause is safe to immediately resume, detach or move.
+        loop {
+            let checking = handle.with_state(|state| match state {
+                ManagedTorrentState::Initializing(init) => init.is_check_running(),
+                _ => false,
+            });
+            if !checking { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         self.try_update_persistence_metadata(handle).await;
         Ok(())
     }
@@ -1623,6 +1700,13 @@ impl Session {
     ) -> anyhow::Result<()> {
         handle.update_only_files(only_files)?;
         self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
+    /// Atomically replace peer ranges only after a complete successful load.
+    pub async fn reload_blocklist(&self, source: &str) -> anyhow::Result<()> {
+        let list = IpRanges::load_from_url(source).await?;
+        *self.blocklist.write() = list;
         Ok(())
     }
 

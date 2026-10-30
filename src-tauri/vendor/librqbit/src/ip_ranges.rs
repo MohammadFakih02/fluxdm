@@ -61,6 +61,12 @@ impl IpRanges {
     pub async fn load_from_url(url: &str) -> Result<Self> {
         let parsed_url = Url::parse(url).context("failed to parse URL")?;
 
+        let list = Self::load_url_inner(parsed_url).await?;
+        anyhow::ensure!(list.len() > 0, "blocklist contains no valid ranges");
+        Ok(list)
+    }
+
+    async fn load_url_inner(parsed_url: Url) -> Result<Self> {
         if parsed_url.scheme() == "file" {
             let path = parsed_url
                 .to_file_path()
@@ -69,7 +75,7 @@ impl IpRanges {
             return Self::load_from_file(path).await;
         }
 
-        let response = reqwest::get(parsed_url)
+        let response = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build()?.get(parsed_url).send()
             .await
             .context("error fetching list")?;
         if !response.status().is_success() {

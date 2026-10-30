@@ -70,6 +70,7 @@ mod session_persistence;
 pub mod session_stats;
 pub mod spawn_utils;
 
+pub mod safe_path;
 pub mod storage;
 mod stream_connect;
 mod torrent_state;

@@ -135,6 +135,9 @@ pub struct Item {
     pub url: String,
     pub file_name: String,
     pub save_folder: String,
+    /// Stable working location, retained across settings changes and restarts.
+    pub incomplete_folder: String,
+    pub existing_file_policy: String,
     pub total_size: i64,
     pub downloaded: i64,
     pub status: DlStatus,
@@ -165,6 +168,9 @@ pub struct Item {
     pub torrent_file: String,
     pub info_hash: String,
     pub skipped_files: Vec<i32>,
+    pub torrent_skip_patterns: String,
+    pub torrent_mark_unfinished: bool,
+    pub seed_seconds: f64,
     /// File index -> priority (1 Low, 3 High, 4 Maximum; Normal isn't stored). New in 2.0.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub file_priorities: std::collections::BTreeMap<i32, u8>,
@@ -191,11 +197,22 @@ pub struct Item {
     #[serde(with = "when_opt")]
     pub icon_lookup_at: Option<When>,
     pub cover_file: String,
+    pub banner_file: String,
+    pub art_color: String,
+    pub banner_revision: u8,
+    pub steam_title: String,
+    pub console_title: String,
 
     // video
     pub is_video: bool,
     pub video_format: String,
     pub video_playlist: bool,
+    /// Chosen playlist entries for --playlist-items (e.g. "1,3,5-9"); empty = all.
+    pub video_playlist_items: String,
+    /// Only this part of the video, "start-end" (e.g. "1:30-2:45"); empty = whole video.
+    pub video_section: String,
+    /// The site's id for the video (from the probe), to spot duplicates.
+    pub video_id: String,
     /// Private staging folder and completed files owned by this video job.
     pub video_work_folder: String,
     pub video_files: Vec<String>,
@@ -234,6 +251,8 @@ pub struct Item {
     pub throttled: i32,
     #[serde(skip)]
     pub speed_history: Vec<f64>,
+    #[serde(skip)]
+    pub upload_history: Vec<f64>,
 }
 
 impl Default for Item {
@@ -243,6 +262,8 @@ impl Default for Item {
             url: String::new(),
             file_name: String::new(),
             save_folder: String::new(),
+            incomplete_folder: String::new(),
+            existing_file_policy: String::new(),
             total_size: -1,
             downloaded: 0,
             status: DlStatus::Paused,
@@ -267,6 +288,9 @@ impl Default for Item {
             torrent_file: String::new(),
             info_hash: String::new(),
             skipped_files: vec![],
+            torrent_skip_patterns: String::new(),
+            torrent_mark_unfinished: false,
+            seed_seconds: 0.0,
             file_priorities: Default::default(),
             sequential: false,
             open_when_done: false,
@@ -282,9 +306,17 @@ impl Default for Item {
             icon_source: String::new(),
             icon_lookup_at: None,
             cover_file: String::new(),
+            banner_file: String::new(),
+            art_color: String::new(),
+            banner_revision: 0,
+            steam_title: String::new(),
+            console_title: String::new(),
             is_video: false,
             video_format: "best".into(),
             video_playlist: false,
+            video_playlist_items: String::new(),
+            video_section: String::new(),
+            video_id: String::new(),
             video_work_folder: String::new(),
             video_files: vec![],
             saved_segments: vec![],
@@ -302,16 +334,21 @@ impl Default for Item {
             connected_peers: 0,
             throttled: 0,
             speed_history: vec![],
+            upload_history: vec![],
         }
     }
 }
 
 impl Item {
+    pub fn storage_folder(&self) -> &str {
+        if self.incomplete_folder.is_empty() { &self.save_folder } else { &self.incomplete_folder }
+    }
     pub fn full_path(&self) -> String {
-        std::path::Path::new(&self.save_folder).join(&self.file_name).to_string_lossy().into_owned()
+        std::path::Path::new(if self.is_torrent { self.storage_folder() } else { &self.save_folder }).join(&self.file_name).to_string_lossy().into_owned()
     }
     pub fn part_path(&self) -> String {
-        self.full_path() + ".fluxpart"
+        if self.incomplete_folder.is_empty() { self.full_path() + ".fluxpart" }
+        else { std::path::Path::new(&self.incomplete_folder).join(format!("{}.fluxpart", self.id)).to_string_lossy().into_owned() }
     }
     pub fn category(&self) -> &'static str {
         if self.is_torrent {
@@ -355,7 +392,10 @@ impl Item {
         let e = &self.error_message;
         match self.status {
             DlStatus::Error => if e.is_empty() { "Error".into() } else { format!("Error: {e}") },
+            DlStatus::Verifying if self.is_torrent => format!("Checking {:.0}%", self.verify_progress),
             DlStatus::Verifying => format!("Verifying {:.0}%", self.verify_progress),
+            DlStatus::Paused if !e.is_empty() => format!("Paused: {e}"),
+            DlStatus::Paused if self.is_torrent && !self.note.is_empty() => format!("Paused: {}", self.note),
             DlStatus::Connecting => if e.is_empty() { "Connecting…".into() } else { format!("Connecting… ({e})") },
             DlStatus::Downloading if !self.note.is_empty() => format!("Downloading · {}", self.note),
             DlStatus::Downloading => if e.is_empty() { "Downloading".into() } else { "Downloading · reconnecting".into() },
@@ -367,6 +407,10 @@ impl Item {
     }
     pub fn push_speed(&mut self, v: f64) {
         self.speed_history.push(v);
+        self.upload_history.push(self.upload_speed);
+        if self.upload_history.len() > 120 {
+            self.upload_history.remove(0);
+        }
         if self.speed_history.len() > 120 {
             self.speed_history.remove(0);
         }
@@ -390,6 +434,9 @@ pub struct QueueDef {
     pub max_concurrent: i32,
     #[serde(rename = "SpeedLimitKBps")]
     pub speed_limit_kbps: i32,
+    pub stop_when_empty: bool,
+    pub retry_count: i32,
+    pub retry_delay_sec: i32,
     pub start_on_launch: bool,
     pub start_at_enabled: bool,
     pub start_at: String,
@@ -407,6 +454,10 @@ pub struct QueueDef {
     pub last_stop_fire: When,
     #[serde(skip)]
     pub running: bool,
+    pub finish_notified: bool,
+    pub schedule_slot: Option<chrono::NaiveDate>,
+    pub last_start_slot: Option<chrono::NaiveDate>,
+    pub last_stop_slot: Option<chrono::NaiveDate>,
     #[serde(skip)]
     pub started_ids: HashSet<String>,
 }
@@ -417,6 +468,9 @@ impl Default for QueueDef {
             name: "Main queue".into(),
             max_concurrent: 2,
             speed_limit_kbps: 0,
+            stop_when_empty: true,
+            retry_count: 0,
+            retry_delay_sec: 20,
             start_on_launch: false,
             start_at_enabled: false,
             start_at: "02:00".into(),
@@ -430,6 +484,10 @@ impl Default for QueueDef {
             last_start_fire: min_when(),
             last_stop_fire: min_when(),
             running: false,
+            finish_notified: false,
+            schedule_slot: None,
+            last_start_slot: None,
+            last_stop_slot: None,
             started_ids: HashSet::new(),
         }
     }
@@ -456,6 +514,33 @@ pub struct Settings {
 
     pub show_icons: bool,
     pub lookup_covers_online: bool,
+    pub background_color: String,
+    pub accent_from_art: bool,
+    pub accent_color: String,
+    pub glass: String,
+    pub line_glow: i32,
+    pub art_behind_window: bool,
+    pub art_selected_only: bool,
+    /// The app icon theme: heat (the original), ice, neon, emerald or mono.
+    pub icon_theme: String,
+    /// How strongly the art behind the window shows, in percent of the measured default (25-500).
+    pub art_strength: i32,
+    /// A fixed blur for the art behind the window in px, or -1 for the automatic one.
+    pub art_blur: i32,
+    /// The same for the art on the selected download in the list: strength in percent (25-400), blur in px.
+    pub card_art_strength: i32,
+    pub card_art_blur: i32,
+    /// The big banner above the details: strength in percent (25-150), blur in px.
+    pub banner_strength: i32,
+    pub banner_blur: i32,
+    pub proxy_mode: String,
+    pub proxy_host: String,
+    pub proxy_port: u16,
+    pub proxy_username: String,
+    pub proxy_password: String,
+    pub proxy_bypass_local: bool,
+    pub existing_file_policy: String,
+    pub incomplete_folder: String,
     pub default_folder: String,
     pub category_subfolders: bool,
     pub default_connections: i32,
@@ -464,6 +549,8 @@ pub struct Settings {
     pub max_retries: i32,
     pub read_timeout_sec: i32,
     pub queue_retries: i32,
+    pub max_manual_downloads: i32,
+    pub last_add_queue: String,
     pub user_agent: String,
     pub clipboard_monitor: bool,
     pub clipboard_extensions: String,
@@ -473,9 +560,12 @@ pub struct Settings {
     pub prevent_sleep: bool,
     pub notify_on_complete: bool,
     pub start_with_windows: bool,
+    /// When FluxDM last asked to turn "Start with Windows" on (it asks again two weeks later while it is off).
+    pub startup_asked_at: Option<chrono::DateTime<chrono::Local>>,
     pub theme: String,
 
     pub speed_schedule_enabled: bool,
+    pub schedule_days_mask: u8,
     pub schedule_from: String,
     pub schedule_to: String,
     #[serde(rename = "ScheduleLimitKBps")]
@@ -483,9 +573,47 @@ pub struct Settings {
 
     pub video_cookies_browser: String,
     pub default_video_format: String,
+    /// "None" | "Download" | "Embed"
+    pub video_subtitles: String,
+    pub video_sub_langs: String,
+    pub video_auto_subs: bool,
+    /// Embed the thumbnail, metadata and chapters into the file.
+    pub video_embed_meta: bool,
+    /// "Off" | "Mark" | "Remove" (YouTube only)
+    pub video_sponsorblock: String,
+    /// A Netscape cookies.txt used instead of browser cookies when set.
+    pub video_cookies_file: String,
+    /// The raw yt-dlp -f selector for the "custom" format.
+    pub video_custom_format: String,
+    pub video_live_from_start: bool,
+    pub video_wait_for_live: bool,
+    /// Record downloaded video ids and skip them next time (--download-archive).
+    pub video_use_archive: bool,
+
+    pub discord_webhook: String,
+    pub discord_on_finished: bool,
+    pub discord_on_failed: bool,
+    pub discord_on_queue: bool,
+    pub discord_on_disk: bool,
+    #[serde(rename = "DiscordDiskGB")]
+    pub discord_disk_gb: i32,
+    pub discord_daily: bool,
+    pub discord_daily_time: String,
+    /// The day the last daily summary was sent (YYYY-MM-DD).
+    pub discord_daily_sent: String,
 
     pub torrent_port: i32,
     pub torrent_seed_ratio: f64,
+    pub torrent_seed_minutes: i32,
+    pub torrent_seed_action: String,
+    pub torrent_always_trackers: String,
+    pub torrent_skip_patterns: String,
+    pub torrent_mark_unfinished: bool,
+    pub torrent_watch_folder: String,
+    pub torrent_blocklist_url: String,
+    pub torrent_enable_dht: bool,
+    pub torrent_enable_local_discovery: bool,
+    pub torrent_ipv4_only: bool,
     #[serde(rename = "TorrentUploadLimitKBps")]
     pub torrent_upload_limit_kbps: i32,
     #[serde(rename = "TorrentSeedingLimitKBps")]
@@ -508,6 +636,22 @@ pub struct Settings {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+impl Settings {
+    pub fn normalize_appearance(&mut self) {
+        self.extra.remove("SteamGridDbApiKey");
+        if !matches!(self.background_color.as_str(), "navy" | "black" | "graphite" | "purple" | "forest") {
+            self.background_color = "navy".into();
+        }
+        if !matches!(self.glass.as_str(), "solid" | "frosted" | "clear" | "ghost") {
+            self.glass = "ghost".into();
+        }
+        if self.accent_color.len() != 7 || !self.accent_color.starts_with('#') || !self.accent_color[1..].bytes().all(|b| b.is_ascii_hexdigit()) {
+            self.accent_color = "#e9c98f".into();
+        }
+        self.line_glow = self.line_glow.clamp(20, 100);
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         let downloads = std::env::var("USERPROFILE").map(|p| format!("{p}\\Downloads")).unwrap_or_else(|_| "C:\\Downloads".into());
@@ -518,6 +662,28 @@ impl Default for Settings {
             details_height: 0.0,
             show_icons: true,
             lookup_covers_online: true,
+            background_color: "navy".into(),
+            accent_from_art: true,
+            accent_color: "#e9c98f".into(),
+            glass: "ghost".into(),
+            line_glow: 70,
+            art_behind_window: true,
+            art_selected_only: true,
+            icon_theme: "heat".into(),
+            art_strength: 100,
+            art_blur: -1,
+            card_art_strength: 100,
+            card_art_blur: 0,
+            banner_strength: 100,
+            banner_blur: 0,
+            proxy_mode: "System".into(),
+            proxy_host: String::new(),
+            proxy_port: 8080,
+            proxy_username: String::new(),
+            proxy_password: String::new(),
+            proxy_bypass_local: false,
+            existing_file_policy: "Number".into(),
+            incomplete_folder: String::new(),
             default_folder: downloads,
             category_subfolders: false,
             default_connections: 8,
@@ -525,6 +691,8 @@ impl Default for Settings {
             max_retries: 30,
             read_timeout_sec: 30,
             queue_retries: 3,
+            max_manual_downloads: 3,
+            last_add_queue: String::new(),
             user_agent: "FluxDM/2.0".into(),
             clipboard_monitor: true,
             clipboard_extensions: "zip rar 7z gz tgz bz2 tbz2 xz txz zst lz lzma lz4 cab arj tar iso img vhd vhdx wim esd dmg pkg exe msi msix msixbundle appx appxbundle apk xapk apks apkm aab ipa deb rpm appimage flatpak snap jar run bin mp4 mkv avi mov webm m4v wmv flv f4v mpg mpeg ts m2ts mts 3gp ogv vob rmvb mp3 flac wav m4a m4b aac ogg oga opus wma aiff aif ape alac mka pdf epub mobi azw azw3 cbz cbr djvu doc docx xls xlsx ppt pptx odt ods odp rtf psd ai eps tif tiff dng cr2 nef arw safetensors gguf ggml ckpt pth pt onnx h5 tflite pb npz pak vpk nsp xci wbfs rom sav ttf otf woff2 sqlite db csv".into(),
@@ -534,15 +702,46 @@ impl Default for Settings {
             prevent_sleep: true,
             notify_on_complete: true,
             start_with_windows: false,
+            startup_asked_at: None,
             theme: "System".into(),
             speed_schedule_enabled: false,
+            schedule_days_mask: 127,
             schedule_from: "09:00".into(),
             schedule_to: "23:00".into(),
             schedule_limit_kbps: 1024,
             video_cookies_browser: "Auto".into(),
             default_video_format: "best".into(),
+            video_subtitles: "None".into(),
+            video_sub_langs: "en.*,ar.*".into(),
+            video_auto_subs: false,
+            video_embed_meta: true,
+            video_sponsorblock: "Off".into(),
+            video_cookies_file: String::new(),
+            video_custom_format: String::new(),
+            video_live_from_start: false,
+            video_wait_for_live: false,
+            video_use_archive: false,
+            discord_webhook: String::new(),
+            discord_on_finished: false,
+            discord_on_failed: false,
+            discord_on_queue: false,
+            discord_on_disk: false,
+            discord_disk_gb: 10,
+            discord_daily: false,
+            discord_daily_time: "23:00".into(),
+            discord_daily_sent: String::new(),
             torrent_port: 0,
             torrent_seed_ratio: 1.0,
+            torrent_seed_minutes: 0,
+            torrent_seed_action: "Stop".into(),
+            torrent_always_trackers: String::new(),
+            torrent_skip_patterns: String::new(),
+            torrent_mark_unfinished: false,
+            torrent_watch_folder: String::new(),
+            torrent_blocklist_url: String::new(),
+            torrent_enable_dht: true,
+            torrent_enable_local_discovery: true,
+            torrent_ipv4_only: false,
             torrent_upload_limit_kbps: 1024,
             torrent_seeding_limit_kbps: 1024,
             torrent_use_upnp: true,
@@ -772,6 +971,38 @@ mod tests {
         assert_eq!(back["WindowLeft"], 300);
         assert_eq!(back["TorrentEnableUtp"], false);
         assert_eq!(back["UserAgent"], "FluxDM/2.0");
+    }
+
+    #[test]
+    fn appearance_defaults_and_pascal_case_round_trip() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        let defaults = serde_json::to_value(&old).unwrap();
+        for (key, value) in serde_json::json!({"BackgroundColor":"navy", "AccentFromArt":true, "AccentColor":"#e9c98f", "Glass":"ghost", "LineGlow":70, "ArtBehindWindow":true, "ArtSelectedOnly":true, "LookupCoversOnline":true}).as_object().unwrap() {
+            assert_eq!(&defaults[key], value);
+        }
+        let input = serde_json::json!({"BackgroundColor":"forest", "AccentFromArt":false, "AccentColor":"#8fd8ff", "Glass":"clear", "LineGlow":20, "ArtBehindWindow":false, "ArtSelectedOnly":false, "LookupCoversOnline":false, "WindowLeft":123});
+        let mut settings: Settings = serde_json::from_value(input.clone()).unwrap();
+        settings.normalize_appearance();
+        let saved = serde_json::to_value(&settings).unwrap();
+        for (key, value) in input.as_object().unwrap() {
+            assert_eq!(&saved[key], value);
+        }
+        let loaded: Settings = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.background_color, "forest");
+        assert!(!loaded.lookup_covers_online);
+    }
+
+    #[test]
+    fn appearance_invalid_values_fall_back_and_glow_is_bounded() {
+        let mut settings = Settings { background_color: "invalid".into(), glass: "invalid".into(), accent_color: "#ééé".into(), line_glow: -1, ..Default::default() };
+        settings.normalize_appearance();
+        assert_eq!(settings.background_color, "navy");
+        assert_eq!(settings.glass, "ghost");
+        assert_eq!(settings.accent_color, "#e9c98f");
+        assert_eq!(settings.line_glow, 20);
+        settings.line_glow = 101;
+        settings.normalize_appearance();
+        assert_eq!(settings.line_glow, 100);
     }
 
     #[test]

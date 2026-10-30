@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::Context;
+use futures::FutureExt;
 
 use rand::{RngExt, seq::IteratorRandom};
 use size_format::SizeFormatterBinary as SF;
@@ -31,8 +32,12 @@ pub struct TorrentStateInitializing {
     pub(crate) metadata: Arc<TorrentMetadata>,
     pub(crate) only_files: Option<Vec<usize>>,
     pub(crate) checked_bytes: AtomicU64,
+    // FluxDM patch: fast-resume samples have a smaller checking denominator.
+    sample_total: AtomicU64,
     pause_requested: AtomicBool,
     check_running: AtomicBool,
+    // FluxDM patch: interrupt checks waiting for a hashing slot too.
+    pub(crate) pause_notify: tokio::sync::Notify,
     previously_errored: bool,
 }
 
@@ -50,10 +55,27 @@ impl TorrentStateInitializing {
             only_files,
             files,
             checked_bytes: AtomicU64::new(0),
+            sample_total: AtomicU64::new(u64::MAX),
             pause_requested: AtomicBool::new(false),
             check_running: AtomicBool::new(false),
+            pause_notify: tokio::sync::Notify::new(),
             previously_errored,
         }
+    }
+
+    // FluxDM patch: include boundary pieces, exclude unselected and padding-only pieces.
+    fn selected_pieces(&self) -> BF {
+        compute_selected_pieces(self.metadata.lengths(),
+            |i| self.only_files.as_ref().map(|f| f.contains(&i)).unwrap_or(true),
+            &self.metadata.file_infos)
+    }
+
+    pub fn checking_total_bytes(&self) -> u64 {
+        let sample = self.sample_total.load(Ordering::Relaxed);
+        if sample != u64::MAX { return sample; }
+        let selected = self.selected_pieces();
+        self.metadata.lengths().iter_piece_infos()
+            .filter(|p| selected[p.piece_index.get() as usize]).map(|p| p.len as u64).sum()
     }
 
     pub fn get_checked_bytes(&self) -> u64 {
@@ -63,10 +85,12 @@ impl TorrentStateInitializing {
 
     pub(crate) fn request_pause(&self) {
         self.pause_requested.store(true, Ordering::Relaxed);
+        self.pause_notify.notify_one();
     }
 
     pub(crate) fn clear_pause_request(&self) {
         self.pause_requested.store(false, Ordering::Relaxed);
+        self.pause_notify.notified().now_or_never();
     }
 
     pub(crate) fn is_pause_requested(&self) -> bool {
@@ -81,6 +105,11 @@ impl TorrentStateInitializing {
 
     pub(crate) fn finish_check(&self) {
         self.check_running.store(false, Ordering::Release);
+    }
+
+    // FluxDM patch: pause waits for hashing to release storage before another operation starts.
+    pub(crate) fn is_check_running(&self) -> bool {
+        self.check_running.load(Ordering::Acquire)
     }
 
     async fn validate_fastresume(
@@ -100,6 +129,12 @@ impl TorrentStateInitializing {
             return None;
         }
 
+        // FluxDM patch: stale unselected claims must not trigger disk reads.
+        let mut hp = hp;
+        let selected = self.selected_pieces();
+        for i in 0..hp.as_slice().len() {
+            if !selected[i] { hp.as_slice_mut().set(i, false); }
+        }
         let is_broken = self
             .shared
             .spawner
@@ -144,26 +179,23 @@ impl TorrentStateInitializing {
                     }
                 }
 
-                let to_validate_count = to_validate.count_ones();
-                for (id, piece_id) in to_validate
+                let total = to_validate.iter_ones().filter_map(|i| self.metadata.lengths().validate_piece_index(i as u32))
+                    .map(|i| self.metadata.lengths().piece_length(i) as u64).sum();
+                self.sample_total.store(total, Ordering::Relaxed);
+                for piece_id in to_validate
                     .iter_ones()
                     .filter_map(|id| {
                         self.metadata
                             .lengths()
                             .validate_piece_index(id.try_into().ok()?)
                     })
-                    .enumerate()
                 {
-                    if fo.check_piece(piece_id).is_err() {
+                    if self.pause_requested.load(Ordering::Relaxed) { return true; }
+                    if !matches!(fo.check_piece(piece_id), Ok(true)) {
                         return true;
                     }
 
-                    #[allow(clippy::cast_possible_truncation)]
-                    let progress = (self.metadata.lengths().total_length() as f64
-                        / to_validate_count as f64
-                        * (id + 1) as f64) as u64;
-                    let progress = progress.min(self.metadata.lengths().total_length());
-                    self.checked_bytes.store(progress, Ordering::Relaxed);
+                    self.checked_bytes.fetch_add(self.metadata.lengths().piece_length(piece_id) as u64, Ordering::Relaxed);
                 }
 
                 false
@@ -171,6 +203,8 @@ impl TorrentStateInitializing {
             .await;
 
         if is_broken {
+            // FluxDM patch: interruption is not corruption; keep the durable resume map.
+            if self.is_pause_requested() { return None; }
             warn!(
                 id = ?self.shared.id,
                 info_hash = ?self.shared.info_hash,
@@ -180,6 +214,7 @@ impl TorrentStateInitializing {
                 warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, "error clearing bitfield: {e:#}");
             }
             self.checked_bytes.store(0, Ordering::Relaxed);
+            self.sample_total.store(u64::MAX, Ordering::Relaxed);
             return None;
         }
 
@@ -208,6 +243,7 @@ impl TorrentStateInitializing {
         };
 
         let have_pieces = self.validate_fastresume(&*bitv_factory, have_pieces).await;
+        anyhow::ensure!(!self.is_pause_requested(), "initial check paused");
 
         let have_pieces = match have_pieces {
             Some(h) => h,
@@ -218,7 +254,7 @@ impl TorrentStateInitializing {
                     .spawner
                     .block_in_place_with_semaphore(|| {
                         FileOps::new(&self.metadata.info, &self.files, &self.metadata.file_infos)
-                            .initial_check(&self.checked_bytes, &self.pause_requested)
+                            .initial_check(&self.checked_bytes, &self.pause_requested, &self.selected_pieces())
                     })
                     .await?;
                 bitv_factory
@@ -302,10 +338,8 @@ impl TorrentStateInitializing {
         // FluxDM patch: a paused torrent keeps its files open too - hold the finished ones read-only
         // so other programs can open them ("file is in use" otherwise).
         for (i, fi) in paused.metadata.file_infos.iter().enumerate() {
-            if fi.len > 0 && !fi.attrs.padding && paused.chunk_tracker.is_file_finished(fi) {
-                if let Err(e) = paused.files.on_file_completed(i) {
-                    tracing::debug!(i, "couldn't reopen finished file read-only: {e:#}");
-                }
+            if !fi.attrs.padding && paused.chunk_tracker.is_file_finished(fi) {
+                paused.files.on_file_completed(i)?;
             }
         }
         Ok(paused)

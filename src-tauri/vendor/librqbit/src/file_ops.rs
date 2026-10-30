@@ -74,6 +74,7 @@ impl<'a> FileOps<'a> {
         &self,
         progress: &AtomicU64,
         pause_requested: &AtomicBool,
+        selected: &crate::type_aliases::BS,
     ) -> anyhow::Result<BF> {
         let mut have_pieces =
             BF::from_boxed_slice(vec![0u8; self.torrent.lengths().piece_bitfield_bytes()].into());
@@ -114,11 +115,13 @@ impl<'a> FileOps<'a> {
                 bail!("initial check paused");
             }
 
+            // FluxDM patch: advance file offsets without reading unselected pieces.
+            let is_selected = selected[piece_info.piece_index.get() as usize];
             piece_files.clear();
             let mut computed_hash = Sha1::new();
             let mut piece_remaining = piece_info.len as usize;
             let mut some_files_broken = false;
-            progress.fetch_add(piece_info.len as u64, Ordering::Relaxed);
+            if is_selected { progress.fetch_add(piece_info.len as u64, Ordering::Relaxed); }
 
             while piece_remaining > 0 {
                 let mut to_read_in_file: usize =
@@ -139,7 +142,7 @@ impl<'a> FileOps<'a> {
                 piece_remaining -= to_read_in_file;
                 current_file.mark_processed_bytes(to_read_in_file as u64);
 
-                if current_file.is_broken {
+                if !is_selected || current_file.is_broken {
                     // no need to read.
                     continue;
                 }
@@ -162,6 +165,7 @@ impl<'a> FileOps<'a> {
                 }
             }
 
+            if !is_selected { continue; }
             if some_files_broken {
                 trace!(
                     "piece {} had errors, marking as needed",

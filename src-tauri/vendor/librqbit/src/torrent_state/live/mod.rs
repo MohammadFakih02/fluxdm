@@ -180,6 +180,8 @@ pub enum AddIncomingPeerResult {
 }
 
 pub struct TorrentStateLive {
+    // FluxDM patch: resume must not overlap callbacks from the previous live state.
+    tasks: tokio_util::task::TaskTracker,
     peers: PeerStates,
     pub(crate) shared: Arc<ManagedTorrentShared>,
     metadata: Arc<TorrentMetadata>,
@@ -309,6 +311,7 @@ impl TorrentStateLive {
         let ratelimits = Limits::new(paused.shared.options.ratelimits);
 
         let state = Arc::new(TorrentStateLive {
+            tasks: tokio_util::task::TaskTracker::new(),
             shared: paused.shared.clone(),
             metadata: paused.metadata.clone(),
             peers: PeerStates {
@@ -359,15 +362,13 @@ impl TorrentStateLive {
                     .file_infos
                     .iter()
                     .enumerate()
-                    .filter(|(_, fi)| fi.len > 0 && !fi.attrs.padding && chunks.is_file_finished(fi))
+                    .filter(|(_, fi)| !fi.attrs.padding && chunks.is_file_finished(fi))
                     .map(|(i, _)| i)
                     .collect(),
                 Err(_) => Vec::new(),
             };
             for i in done {
-                if let Err(e) = state.files.on_file_completed(i) {
-                    debug!(i, "couldn't reopen finished file read-only: {e:#}");
-                }
+                state.files.on_file_completed(i)?;
             }
         }
 
@@ -401,6 +402,18 @@ impl TorrentStateLive {
             },
         );
 
+        // FluxDM patch: low-speed transfers may take hours to reach the byte threshold.
+        state.spawn(debug_span!(parent: state.shared.span.clone(), "resume_flush"), "resume_flush", {
+            let state = Arc::downgrade(&state);
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    let Some(state) = state.upgrade() else { return Ok(()); };
+                    state.lock_write("resume_flush").try_flush_bitv(&state.shared, true);
+                }
+            }
+        });
+
         state.spawn(
             debug_span!(parent: state.shared.span.clone(), "peer_turnover"),
             format!("[{}]peer_turnover", state.shared.id),
@@ -428,7 +441,18 @@ impl TorrentStateLive {
         name: impl Into<Cow<'static, str>>,
         fut: impl std::future::Future<Output = crate::Result<()>> + Send + 'static,
     ) {
-        spawn_with_cancel(span, name, self.cancellation_token.clone(), fut);
+        // FluxDM patch: track cancellation cleanup as well as the task body.
+        let token = self.tasks.token();
+        spawn_with_cancel(span, name, self.cancellation_token.clone(), async move {
+            let _token = token;
+            fut.await
+        });
+    }
+
+    pub(crate) async fn wait_for_paused_tasks(&self) {
+        self.cancellation_token.cancel();
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 
     pub fn down_speed_estimator(&self) -> &SpeedEstimator {
@@ -722,7 +746,7 @@ impl TorrentStateLive {
                 continue;
             }
 
-            if session.blocklist.has(addr.ip()) {
+            if session.blocklist.read().has(addr.ip()) {
                 session
                     .stats
                     .counters
@@ -868,6 +892,8 @@ impl TorrentStateLive {
         // It should be impossible to make a fatal error after pausing.
         g.fatal_errors_tx.take();
 
+        // FluxDM patch: persist small downloads before transferring the chunk tracker.
+        g.try_flush_bitv(&self.shared, false);
         let piece_tracker = g
             .pieces
             .take()
@@ -911,6 +937,8 @@ impl TorrentStateLive {
 
     pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
         let mut g = self.lock_write("update_only_files");
+        // FluxDM patch: migrate before exposing the new piece selection.
+        self.files.set_file_selection(Some(&only_files.iter().copied().collect::<Vec<_>>()))?;
         let pt = g.get_pieces_mut()?;
         let hns = pt.update_only_files(&self.metadata.file_infos, only_files)?;
         if !hns.finished() {
@@ -962,9 +990,7 @@ impl TorrentStateLive {
         {
             let remaining = pieces.update_file_have_on_piece_completed(id, idx, file_info);
             if remaining == 0 && file_info.len > 0 && !file_info.attrs.padding {
-                if let Err(e) = self.files.on_file_completed(idx) {
-                    debug!(idx, "couldn't reopen finished file read-only: {e:#}");
-                }
+                self.files.on_file_completed(idx)?;
             }
         }
 
@@ -1740,7 +1766,7 @@ impl PeerHandler {
         Ok(())
     }
 
-    /// Acquire a piece for this peer: try steal (10x) → reserve → steal (3x).
+    /// Acquire a piece for this peer: try steal (10x) â†’ reserve â†’ steal (3x).
     ///
     /// Returns the piece index to download, or None if no pieces are available.
     fn acquire_next_piece(&self) -> crate::Result<Option<ValidPieceIndex>> {
@@ -2003,7 +2029,7 @@ impl PeerHandler {
             update_interest(self, true)?;
             aframe!(self.wait_for_request_slot()).await;
 
-            // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
+            // Acquire a piece using the strategy: try steal (10x) â†’ reserve â†’ steal (3x).
             let new_piece_notify = self.state.new_pieces_notify.notified();
             let next = match self.acquire_next_piece()? {
                 Some(next) => next,
@@ -2296,7 +2322,9 @@ impl PeerHandler {
 
                     trace!(piece = index, "successfully downloaded and verified");
 
-                    state.on_piece_completed(chunk_info.piece_index)?;
+                    if let Err(e) = state.on_piece_completed(chunk_info.piece_index) {
+                        return state.on_fatal_error(e);
+                    }
 
                     state.transmit_haves(chunk_info.piece_index);
                 }

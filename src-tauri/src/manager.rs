@@ -95,6 +95,7 @@ pub struct Manager {
     tick_no: AtomicU64,
     keep_awake: Mutex<Option<bool>>,
     last_tick: Mutex<Option<Instant>>,
+    last_scheduler: Mutex<Option<chrono::NaiveDateTime>>,
     pub total_speed: Mutex<f64>,
     stalled_since: Mutex<HashMap<String, Instant>>,
     last_stall_restart: Mutex<HashMap<String, Instant>>,
@@ -103,6 +104,7 @@ pub struct Manager {
     sent_order: Mutex<Vec<String>>,
     sent_summary: Mutex<String>,
     pub exiting: AtomicBool,
+    watched: Arc<tokio::sync::Mutex<crate::watched::Watcher>>,
 }
 
 const STALL_THRESHOLD: Duration = Duration::from_secs(100);
@@ -146,6 +148,69 @@ fn video_budget_changed(started: i64, current: i64, elapsed: Duration) -> bool {
         && (started == 0 || current == 0 || (current - started).abs() as f64 > started as f64 * 0.30)
 }
 
+fn load_queue_defs(raw: Vec<Value>, legacy_retries: Option<i32>) -> Vec<QueueDef> {
+    raw.into_iter().filter_map(|value| {
+        let missing_retries = value.get("RetryCount").is_none();
+        let mut q: QueueDef = serde_json::from_value(value).ok()?;
+        if missing_retries {
+            q.retry_count = legacy_retries.unwrap_or(0).clamp(0, 100);
+        }
+        Some(q)
+    }).collect()
+}
+
+// Slot identity is the scheduled local date, independent of UTC offsets during DST changes.
+fn scheduled_start(q: &QueueDef, now: chrono::NaiveDateTime) -> Option<chrono::NaiveDate> {
+    if !q.start_at_enabled { return None; }
+    let start = parse_hhmm(&q.start_at)?;
+    let minute = (now.hour() * 60 + now.minute()) as i32;
+    let day = if minute >= start { now.date() } else { now.date().pred_opt()? };
+    let stop = if q.stop_at_enabled { parse_hhmm(&q.stop_at)? } else { 1440 };
+    let elapsed = if minute >= start { minute - start } else { minute + 1440 - start };
+    let duration = if !q.stop_at_enabled { 1440 } else if stop > start { stop - start } else { stop + 1440 - start };
+    if elapsed >= duration { return None; }
+    let enabled = if q.daily { q.days_mask & (1 << day.weekday().num_days_from_sunday()) != 0 }
+        else { q.once_date.date_naive() == day };
+    let last = q.last_start_slot.unwrap_or_else(|| q.last_start_fire.date_naive());
+    (enabled && last < day).then_some(day)
+}
+
+pub fn preserve_queue_runtime(parsed: &mut QueueDef, old: &QueueDef, now: chrono::NaiveDateTime) {
+    parsed.running = old.running;
+    parsed.started_ids = old.started_ids.clone();
+    parsed.finish_notified = old.finish_notified;
+    parsed.schedule_slot = old.schedule_slot;
+    parsed.last_start_slot = old.last_start_slot;
+    parsed.last_stop_slot = old.last_stop_slot;
+    parsed.last_start_fire = old.last_start_fire;
+    parsed.last_stop_fire = old.last_stop_fire;
+    let changed = parsed.start_at != old.start_at || parsed.days_mask != old.days_mask
+        || parsed.daily != old.daily || parsed.once_date != old.once_date || parsed.start_at_enabled != old.start_at_enabled;
+    if changed && parsed.start_at_enabled && parse_hhmm(&parsed.start_at).is_some_and(|t| t > (now.hour() * 60 + now.minute()) as i32) {
+        // Exclude yesterday's catch-up slot while allowing the new time today.
+        parsed.last_start_slot = now.date().pred_opt();
+        parsed.last_start_fire = min_when();
+    }
+}
+
+fn scheduled_stop(q: &QueueDef, now: chrono::NaiveDateTime, previous: Option<chrono::NaiveDateTime>) -> Option<chrono::NaiveDate> {
+    if !q.stop_at_enabled { return None; }
+    let stop = parse_hhmm(&q.stop_at)?;
+    let at = |day: chrono::NaiveDate| day.and_hms_opt((stop / 60) as u32, (stop % 60) as u32, 0);
+    let today = at(now.date())?;
+    let day = if now >= today { now.date() } else { now.date().pred_opt()? };
+    let deadline = at(day)?;
+    let last = q.last_stop_slot.unwrap_or_else(|| q.last_stop_fire.date_naive());
+    if last >= day { return None; }
+    let crossed = previous.is_some_and(|p| p < deadline && now >= deadline);
+    let expired_slot = q.schedule_slot.is_some_and(|slot| {
+        let start = parse_hhmm(&q.start_at).unwrap_or(0);
+        let end_day = if stop <= start { slot.succ_opt().unwrap_or(slot) } else { slot };
+        at(end_day).is_some_and(|end| now >= end)
+    });
+    (crossed || expired_slot || (previous.is_none() && now.signed_duration_since(deadline).num_seconds() < 60)).then_some(day)
+}
+
 impl Manager {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -159,6 +224,7 @@ impl Manager {
             tick_no: AtomicU64::new(0),
             keep_awake: Mutex::new(None),
             last_tick: Mutex::new(None),
+            last_scheduler: Mutex::new(None),
             total_speed: Mutex::new(0.0),
             stalled_since: Mutex::new(HashMap::new()),
             last_stall_restart: Mutex::new(HashMap::new()),
@@ -166,6 +232,7 @@ impl Manager {
             sent_order: Mutex::new(vec![]),
             sent_summary: Mutex::new(String::new()),
             exiting: AtomicBool::new(false),
+            watched: Arc::new(tokio::sync::Mutex::new(crate::watched::Watcher::default())),
         })
     }
 
@@ -181,6 +248,22 @@ impl Manager {
 
     pub fn toast(&self, title: &str, body: &str, reveal: Option<String>) {
         self.emit("toast", json!({ "title": title, "body": body, "reveal": reveal }));
+    }
+
+    /// A problem the user should notice (a port in use, a file that couldn't be removed): shown with a warning icon.
+    pub fn warn_toast(&self, title: &str, body: &str) {
+        self.emit("toast", json!({ "kind": "warning", "title": title, "body": body }));
+    }
+
+    fn item_toast(&self, it: &Item, kind: &str, body: String) {
+        let s = self.settings();
+        self.emit("toast", json!({
+            "kind": kind, "id": it.id, "title": if kind == "finished" { format!("{} finished", crate::covers::display_title(it)) } else { "Download failed".into() },
+            "fileName": it.file_name, "body": body, "reveal": if kind == "finished" { Some(it.full_path()) } else { None },
+            "torrent": it.is_torrent, "game": crate::covers::is_game(it), "artColor": it.art_color, "banner": crate::covers::banner_url(it, &s), "icon": crate::covers::icon_url(it, &s),
+            "size": fmt::size(it.total_size), "duration": fmt::duration(it.active_seconds),
+            "checksum": !it.expected_hash.is_empty() && it.error_message.is_empty(),
+        }));
     }
 
     pub fn mark_dirty(&self) {
@@ -214,6 +297,17 @@ impl Manager {
 
     // ------------------------------------------------------------------ limits
 
+    pub fn add_queue_choice(&self, requested: Option<&str>) -> String {
+        let st = self.st.lock();
+        let name = requested.unwrap_or(&st.settings.last_add_queue);
+        if st.queues.iter().any(|q| q.name == name) { name.to_string() } else { String::new() }
+    }
+
+    pub fn remember_add_queue(&self, name: &str) {
+        let mut st = self.st.lock();
+        st.settings.last_add_queue = if st.queues.iter().any(|q| q.name == name) { name.to_string() } else { String::new() };
+    }
+
     pub fn queue_limiter(&self, queue: &str) -> Option<Arc<Limiter>> {
         if queue.is_empty() {
             return None;
@@ -224,7 +318,16 @@ impl Manager {
     /// True while the speed schedule's time window is in effect.
     pub fn schedule_active(s: &Settings) -> bool {
         let now = Local::now();
-        s.speed_schedule_enabled && in_window(&s.schedule_from, &s.schedule_to, (now.hour() * 60 + now.minute()) as i32)
+        Self::schedule_active_at(s, now.naive_local())
+    }
+
+    pub fn schedule_active_at(s: &Settings, now: chrono::NaiveDateTime) -> bool {
+        let minute = (now.hour() * 60 + now.minute()) as i32;
+        let from = parse_hhmm(&s.schedule_from).unwrap_or(0);
+        let to = parse_hhmm(&s.schedule_to).unwrap_or(0);
+        let day = if from > to && minute < to { now.date().pred_opt().unwrap_or(now.date()) } else { now.date() };
+        s.speed_schedule_enabled && s.schedule_days_mask & (1 << day.weekday().num_days_from_sunday()) != 0
+            && in_window(&s.schedule_from, &s.schedule_to, minute)
     }
 
     /// Global limit after applying the speed schedule (the stricter of the two wins), KB/s.
@@ -288,8 +391,16 @@ impl Manager {
 
     pub fn load(self: &Arc<Self>, updated: bool) {
         let mut settings: Settings = store::read("settings.json").unwrap_or_default();
+        settings.normalize_appearance();
+        if let Err(e) = net::configure_proxy(&settings) { crate::util::log_error(&e); }
         if settings.remote_pin.len() < 4 {
             settings.remote_pin = crate::util::random_pin();
+        }
+        // settings.json keeps what the user chose; the registry entry is only the means. If it was on but the
+        // entry is gone or points at another copy (an update or reinstall), put it back for this exe.
+        // Not for an isolated copy (FLUXDM_DATA set): a test build must never take over the real startup entry.
+        if settings.start_with_windows && std::env::var_os("FLUXDM_DATA").is_none() && !win::starts_with_windows() {
+            win::set_start_with_windows(true);
         }
         settings.start_with_windows = win::starts_with_windows();
         // The old, short default list missed many file types; anyone still on it gets the new one.
@@ -301,7 +412,9 @@ impl Manager {
         if settings.update_repo.trim().is_empty() {
             settings.update_repo = Settings::default().update_repo;
         }
-        let mut queues: Vec<QueueDef> = store::read("queues.json").unwrap_or_default();
+        let legacy_retries = store::read::<Value>("settings.json")
+            .and_then(|s| s.get("QueueRetries").and_then(Value::as_i64)).map(|n| n.clamp(0, 100) as i32);
+        let mut queues = load_queue_defs(store::read("queues.json").unwrap_or_default(), legacy_retries);
         if queues.is_empty() {
             queues.push(QueueDef::default());
         }
@@ -381,6 +494,10 @@ impl Manager {
     }
 
     pub fn save(&self) {
+        let _ = self.save_checked();
+    }
+
+    pub fn save_checked(&self) -> std::io::Result<()> {
         // Snapshot and write as one step, so a slower older save can't land after a newer one.
         static SAVING: Mutex<()> = Mutex::new(());
         let _g = SAVING.lock();
@@ -406,10 +523,11 @@ impl Manager {
             .and_then(|_| store::write("settings.json", &settings))
             .and_then(|_| store::write("queues.json", &queues))
             .and_then(|_| store::write("stats.json", &stats));
-        match r {
+        match &r {
             Ok(()) => self.dirty.store(false, Ordering::Relaxed),
             Err(e) => crate::util::log_error(&format!("Save failed: {e}")),
         }
+        r
     }
 
     // ------------------------------------------------------------------ creating items
@@ -425,6 +543,12 @@ impl Manager {
     /// Picks "name (n).ext" if the name is taken on disk or by another unfinished download.
     pub fn unique_name(&self, folder: &str, name: &str, self_id: Option<&str>, pending: &[Item]) -> String {
         let st = self.st.lock();
+        let policy = self_id.and_then(|id| st.items.iter().find(|it| it.id == id)).map(|it| it.existing_file_policy.as_str()).filter(|s| !s.is_empty()).unwrap_or(&st.settings.existing_file_policy);
+        if policy != "Number" {
+            let clean = net::sanitize(name);
+            let full = std::path::Path::new(folder).join(&clean).to_string_lossy().to_lowercase();
+            if !clean.is_empty() && !st.items.iter().chain(pending).any(|o| Some(o.id.as_str()) != self_id && o.status != DlStatus::Completed && o.full_path().to_lowercase() == full) { return clean; }
+        }
         Self::unique_name_in(&st.items, folder, name, self_id, pending)
     }
 
@@ -495,6 +619,9 @@ impl Manager {
             is_torrent: true,
             save_folder: dir,
             file_name: net::sanitize(&display),
+            torrent_skip_patterns: if skipped.is_none() { s.torrent_skip_patterns.clone() } else { String::new() },
+            torrent_mark_unfinished: s.torrent_mark_unfinished,
+            extra_trackers: crate::torrent::tracker_lines(&s.torrent_always_trackers).unwrap_or_default(),
             skipped_files: skipped.unwrap_or_default(),
             resumable: true,
             ..Default::default()
@@ -536,6 +663,10 @@ impl Manager {
         {
             let mut st = self.st.lock();
             for mut it in items {
+                if it.existing_file_policy.is_empty() { it.existing_file_policy = st.settings.existing_file_policy.clone(); }
+                if !it.is_video && it.incomplete_folder.is_empty() && !st.settings.incomplete_folder.trim().is_empty() {
+                    it.incomplete_folder = std::path::Path::new(&st.settings.incomplete_folder).join(&it.id).to_string_lossy().into_owned();
+                }
                 if it.is_torrent {
                     if it.info_hash.is_empty() {
                         it.info_hash = crate::torrent::source_hash(&it.url).unwrap_or_default();
@@ -593,6 +724,20 @@ impl Manager {
     // ------------------------------------------------------------------ start / stop
 
     pub fn start(self: &Arc<Self>, id: &str) {
+        let guard = if self.item(id).is_some_and(|i| i.is_torrent) {
+            match self.torrents.operation(id).try_lock_owned() {
+                Ok(g) => Some(g),
+                Err(_) => {
+                    self.with_item(id, |i| i.note = "An operation is still finishing; try Resume again shortly".into());
+                    return;
+                }
+            }
+        } else { None };
+        self.start_inner(id, guard);
+    }
+
+    pub(crate) fn start_inner(self: &Arc<Self>, id: &str, guard: Option<tokio::sync::OwnedMutexGuard<()>>) {
+        if self.exiting.load(Ordering::Relaxed) { return; }
         let (kind, limit, queue) = {
             let st = self.st.lock();
             let Some(it) = st.items.iter().find(|i| i.id == id) else { return };
@@ -601,6 +746,7 @@ impl Manager {
                 if it.is_torrent {
                     let (mgr, id) = (self.clone(), id.to_string());
                     tauri::async_runtime::spawn(async move {
+                        let _guard = guard;
                         mgr.torrents.resume_seeding(&mgr, &id).await;
                         mgr.push_list();
                     });
@@ -612,6 +758,19 @@ impl Manager {
         let mut running = self.running.lock();
         if running.contains_key(id) {
             return;
+        }
+        {
+            let mut st = self.st.lock();
+            if queue.is_empty() && st.items.iter().filter(|i| i.queue_name.is_empty() && running.contains_key(&i.id)).count()
+                >= st.settings.max_manual_downloads.clamp(1, 100) as usize
+            {
+                if let Some(it) = st.items.iter_mut().find(|i| i.id == id) {
+                    it.status = DlStatus::Queued;
+                    it.not_before = None;
+                }
+                self.mark_dirty();
+                return;
+            }
         }
         let (tx, _) = watch::channel(false);
         let run = Arc::new(Run {
@@ -634,6 +793,7 @@ impl Manager {
         running.insert(id.to_string(), run.clone());
         if let Some(q) = self.st.lock().queues.iter_mut().find(|q| q.name == queue && q.running) {
             q.started_ids.insert(id.to_string());
+            q.finish_notified = false;
         }
         drop(running);
         self.refresh_limits();
@@ -661,12 +821,17 @@ impl Manager {
             }
         }
         self.refresh_limits();
+        if let Some(it) = self.item(&run.id).filter(|i| i.existing_file_policy == "Ask" && i.status == DlStatus::Paused && i.error_message.contains("file conflict dialog")) {
+            self.emit("file-conflict", json!({ "id": it.id, "name": it.file_name }));
+        }
         let settings = self.settings();
         let mut completed: Option<Item> = None;
         let mut failed: Option<Item> = None;
+        let mut retrying: Option<Item> = None;
         {
             let mut st = self.st.lock();
-            let queue_running: HashSet<String> = st.queues.iter().filter(|q| q.running).map(|q| q.name.clone()).collect();
+            let retries: HashMap<String, (i32, i32)> = st.queues.iter().filter(|q| q.running)
+                .map(|q| (q.name.clone(), (q.retry_count.clamp(0, 100), q.retry_delay_sec.clamp(1, 86400)))).collect();
             let mut file_done = false;
             if let Some(it) = st.items.iter_mut().find(|i| i.id == run.id) {
                 it.speed = 0.0;
@@ -679,10 +844,11 @@ impl Manager {
                     it.headers = it.headers.split('\n').filter(|l| !l.trim_start().to_ascii_lowercase().starts_with("cookie:")).collect::<Vec<_>>().join("\n");
                     completed = Some(it.clone());
                 } else if it.status == DlStatus::Error {
-                    if queue_running.contains(&it.queue_name) && it.retry_count < settings.queue_retries {
+                    if let Some((_, delay)) = retries.get(&it.queue_name).filter(|(count, _)| it.retry_count < *count) {
                         it.retry_count += 1;
-                        it.not_before = Some(Local::now() + chrono::Duration::seconds(20 * it.retry_count as i64));
+                        it.not_before = Some(Local::now() + chrono::Duration::seconds(*delay as i64));
                         it.status = DlStatus::Queued;
+                        retrying = Some(it.clone());
                     } else {
                         failed = Some(it.clone());
                     }
@@ -698,15 +864,16 @@ impl Manager {
         }
         if let Some(it) = completed {
             if settings.notify_on_complete {
-                let ok = if !it.expected_hash.is_empty() && it.error_message.is_empty() { "  ✓ checksum OK" } else { "" };
-                self.toast("Download complete", &format!("{}{ok}", it.file_name), Some(it.full_path()));
+                self.item_toast(&it, "finished", String::new());
             }
+            crate::notify::finished(&settings, &it);
             if it.open_when_done {
                 win::open(&it.full_path());
             }
             crate::covers::refresh_ids(self, std::slice::from_ref(&it.id));
         }
         if let Some(it) = failed {
+            if !self.exiting.load(Ordering::Relaxed) { crate::notify::failed(&settings, &it); }
             if settings.notify_on_complete && !self.exiting.load(Ordering::Relaxed) {
                 // Kept short and on two lines: a long name or error text overflowed the small notification card.
                 let clip = |s: &str, n: usize| -> String {
@@ -714,7 +881,13 @@ impl Manager {
                     if one.chars().count() > n { format!("{}…", one.chars().take(n).collect::<String>().trim_end()) } else { one }
                 };
                 let why = if it.error_message.trim().is_empty() { "Unknown error".to_string() } else { clip(&it.error_message, 85) };
-                self.toast("Download failed", &format!("{}\n{}", clip(&it.file_name, 40), why), None);
+                self.item_toast(&it, "error", format!("{}\n{}", clip(&it.file_name, 60), why));
+            }
+        }
+        if let Some(it) = retrying {
+            if settings.notify_on_complete && !self.exiting.load(Ordering::Relaxed) {
+                let delay = it.not_before.map(|t| (t - Local::now()).num_seconds().max(1)).unwrap_or(1);
+                self.item_toast(&it, "retrying", format!("{} - retry {} in {} s. {}", it.file_name, it.retry_count, delay, it.error_message));
             }
         }
         self.save();
@@ -724,6 +897,14 @@ impl Manager {
 
     /// Stops a download and waits until it has fully let go (so an immediate start isn't ignored).
     pub async fn pause(self: &Arc<Self>, id: &str) {
+        self.torrents.cancel_check(id);
+        let _guard = if self.item(id).is_some_and(|i| i.is_torrent) {
+            Some(self.torrents.operation(id).lock_owned().await)
+        } else { None };
+        self.pause_inner(id).await;
+    }
+
+    pub(crate) async fn pause_inner(self: &Arc<Self>, id: &str) {
         if let Some(run) = self.run_of(id) {
             {
                 // Serialize a pause with the runner's final completion step.
@@ -731,7 +912,11 @@ impl Manager {
                 run.cancel.cancel();
             }
             let mut rx = run.ended.subscribe();
-            let _ = tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|v| *v)).await;
+            if run.kind == Kind::Torrent {
+                let _ = rx.wait_for(|v| *v).await;
+            } else {
+                let _ = tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|v| *v)).await;
+            }
             return;
         }
         let (torrent_done, queued) = self
@@ -759,6 +944,9 @@ impl Manager {
             for q in st.queues.iter_mut() {
                 q.running = false;
             }
+            for it in &mut st.items {
+                if it.status == DlStatus::Queued { it.status = DlStatus::Paused; }
+            }
             st.items.iter().map(|i| i.id.clone()).collect()
         };
         let futs = ids.iter().map(|id| self.pause(id));
@@ -770,9 +958,9 @@ impl Manager {
         self.pause(id).await;
         let Some(it) = self.item(id) else { return };
         if it.is_video {
-            if self.is_running(id) { return self.toast("Couldn't remove video", "The video process is still stopping. Try again shortly.", None); }
+            if self.is_running(id) { return self.warn_toast("Couldn't remove video", "The video process is still stopping. Try again shortly."); }
             if delete_file || it.status != DlStatus::Completed {
-                if let Err(e) = crate::video::cleanup(&it, it.status == DlStatus::Completed) { return self.toast("Couldn't delete video files", &e.to_string(), None); }
+                if let Err(e) = crate::video::cleanup(&it, it.status == DlStatus::Completed) { return self.warn_toast("Couldn't delete video files", &e.to_string()); }
             }
         }
         self.st.lock().items.retain(|i| i.id != id);
@@ -800,9 +988,9 @@ impl Manager {
             self.torrents.remove(self, &it, true).await;
         }
         if it.is_video {
-            if self.is_running(id) { return self.toast("Couldn't restart video", "The video process is still stopping. Try again shortly.", None); }
+            if self.is_running(id) { return self.warn_toast("Couldn't restart video", "The video process is still stopping. Try again shortly."); }
             if let Err(e) = crate::video::cleanup(&it, false) {
-                self.toast("Couldn't restart video", &e.to_string(), None);
+                self.warn_toast("Couldn't restart video", &e.to_string());
                 return;
             }
         }
@@ -826,15 +1014,22 @@ impl Manager {
         {
             let running: HashSet<String> = self.running.lock().keys().cloned().collect();
             let mut st = self.st.lock();
+            let Some(q) = st.queues.iter().find(|q| q.name == name) else { return };
+            if q.running { return; }
+            let started_ids = running.iter().filter(|id| st.items.iter().any(|i| &i.id == *id && i.queue_name == name)).cloned().collect();
             for it in st.items.iter_mut() {
                 if it.queue_name == name && !running.contains(&it.id) && matches!(it.status, DlStatus::Paused | DlStatus::Error) {
                     it.status = DlStatus::Queued;
                     it.retry_count = 0;
+                    it.not_before = None;
                 }
             }
             if let Some(q) = st.queues.iter_mut().find(|q| q.name == name) {
-                q.started_ids.clear();
+                q.started_ids = started_ids;
+                q.finish_notified = false;
+                q.schedule_slot = None;
                 q.running = true;
+                self.mark_dirty();
             }
         }
         self.pump_queues();
@@ -846,6 +1041,8 @@ impl Manager {
             let mut st = self.st.lock();
             if let Some(q) = st.queues.iter_mut().find(|q| q.name == name) {
                 q.running = false;
+                q.schedule_slot = None;
+                self.mark_dirty();
             }
             let mut v = vec![];
             for it in st.items.iter_mut().filter(|i| i.queue_name == name) {
@@ -863,14 +1060,25 @@ impl Manager {
         }
     }
 
-    pub fn rename_queue(&self, old: &str, new: &str) {
+    pub fn rename_queue(&self, old: &str, new: &str) -> Result<(), String> {
         let mut st = self.st.lock();
+        if new.trim().is_empty() { return Err("A queue needs a name.".into()); }
+        if st.queues.iter().any(|q| q.name != old && q.name.eq_ignore_ascii_case(new)) {
+            return Err("Another queue already has that name.".into());
+        }
+        if !st.queues.iter().any(|q| q.name == old) { return Err("That queue no longer exists.".into()); }
+        if old == new { return Ok(()); }
+        // Keep existing consumers attached to the same token bucket.
+        { let mut limiters = self.queue_limiters.lock();
+          if let Some(limiter) = limiters.remove(old) { limiters.insert(new.to_owned(), limiter); } }
+        if st.settings.last_add_queue == old { st.settings.last_add_queue = new.to_string(); }
         for it in st.items.iter_mut().filter(|i| i.queue_name == old) {
             it.queue_name = new.to_string();
         }
         if let Some(q) = st.queues.iter_mut().find(|q| q.name == old) {
             q.name = new.to_string();
         }
+        Ok(())
     }
 
     pub fn delete_queue(self: &Arc<Self>, name: &str) {
@@ -880,6 +1088,7 @@ impl Manager {
             it.queue_name.clear();
         }
         st.queues.retain(|q| q.name != name);
+        if st.settings.last_add_queue == name { st.settings.last_add_queue.clear(); }
     }
 
     pub fn queue_members(st: &State, name: &str) -> Vec<String> {
@@ -898,7 +1107,7 @@ impl Manager {
             let names: Vec<String> = st.queues.iter().filter(|q| q.running).map(|q| q.name.clone()).collect();
             for name in names {
                 let members = Self::queue_members(&st, &name);
-                let max = st.queues.iter().find(|q| q.name == name).map(|q| q.max_concurrent).unwrap_or(2);
+                let max = st.queues.iter().find(|q| q.name == name).map(|q| q.max_concurrent.clamp(1, 20)).unwrap_or(2);
                 let mut active = members.iter().filter(|id| running.contains(*id)).count() as i32;
                 for id in &members {
                     if active >= max {
@@ -912,33 +1121,63 @@ impl Manager {
                 }
                 let any_queued = members.iter().any(|id| st.items.iter().any(|i| &i.id == id && i.status == DlStatus::Queued));
                 let all_completed = Self::queue_completed(&st, &name);
+                let failures = st.queues.iter().find(|q| q.name == name).map(|q|
+                    st.items.iter().filter(|i| q.started_ids.contains(&i.id) && i.status == DlStatus::Error).count()).unwrap_or(0);
                 if let Some(q) = st.queues.iter_mut().find(|q| q.name == name) {
                     if active == 0 && !any_queued {
-                        q.running = false;
-                        if all_completed {
-                            finished.push(q.clone());
+                        if (all_completed || failures > 0) && !q.finish_notified {
+                            finished.push((q.clone(), failures));
+                            q.finish_notified = true;
+                            self.mark_dirty();
+                        }
+                        if q.stop_when_empty {
+                            q.running = false;
+                            self.mark_dirty();
                         }
                     }
                 }
             }
+            let active = st.items.iter().filter(|i| i.queue_name.is_empty() && running.contains(&i.id)).count();
+            let slots = (st.settings.max_manual_downloads.clamp(1, 100) as usize).saturating_sub(active);
+            let mut waiting: Vec<&Item> = st.items.iter().filter(|i| i.queue_name.is_empty()
+                && i.status == DlStatus::Queued && !running.contains(&i.id) && i.not_before.is_none_or(|t| t <= now)).collect();
+            waiting.sort_by_key(|i| i.queue_order);
+            to_start.extend(waiting.into_iter().take(slots).map(|i| i.id.clone()));
         }
         for id in to_start {
             self.start(&id);
         }
-        for q in finished {
-            self.on_queue_finished(q);
+        for (q, failures) in finished {
+            self.on_queue_finished(q, failures);
         }
     }
 
-    fn on_queue_finished(self: &Arc<Self>, q: QueueDef) {
+    fn on_queue_finished(self: &Arc<Self>, q: QueueDef, failures: usize) {
         let s = self.settings();
+        let done = self.st.lock().items.iter().filter(|i| q.started_ids.contains(&i.id) && i.status == DlStatus::Completed).count();
+        crate::notify::queue_finished(&s, &q.name, done, failures);
+        if failures > 0 {
+            if s.notify_on_complete { self.toast("Queue stopped", &format!("Queue {} stopped: {} failed", q.name, failures), None); }
+            return;
+        }
         if s.notify_on_complete {
             self.toast("Queue finished", &format!("Everything in “{}” is done.", q.name), None);
         }
         if q.post_action != PostAction::None {
+            if self.has_pending_downloads() {
+                self.toast("Finish action skipped", "Other downloads are still running or waiting. The finish action was skipped.", None);
+                return;
+            }
             self.save();
             self.emit("countdown", json!({ "action": format!("{:?}", q.post_action), "force": q.force_shutdown, "queue": q.name }));
         }
+    }
+
+    pub fn has_pending_downloads(&self) -> bool {
+        if !self.running.lock().is_empty() { return true; }
+        let st = self.st.lock();
+        st.items.iter().any(|i| i.status.is_active() || (i.status == DlStatus::Queued
+            && (i.queue_name.is_empty() || st.queues.iter().any(|q| q.name == i.queue_name && q.running))))
     }
 
     fn queue_completed(st: &State, name: &str) -> bool {
@@ -948,48 +1187,36 @@ impl Manager {
 
     fn run_scheduler(self: &Arc<Self>) {
         let now = Local::now();
-        let min = (now.hour() * 60 + now.minute()) as i32;
-        // The 5-minute window after a set time may spill past midnight (23:58 → 00:02); that spill still
-        // belongs to the day the time was set for, so the day is yesterday there.
-        let due = |hhmm: &str| {
-            parse_hhmm(hhmm).and_then(|t| {
-                let since = (min - t).rem_euclid(1440);
-                (since < 5).then(|| if min >= t { now.date_naive() } else { now.date_naive() - chrono::Duration::days(1) })
-            })
-        };
+        let wall = now.naive_local();
+        let previous = self.last_scheduler.lock().replace(wall);
         let mut start = vec![];
         let mut stop = vec![];
         {
             let mut st = self.st.lock();
-            for q in st.queues.iter_mut() {
-                if q.start_at_enabled && !q.running {
-                    if let Some(day) = due(&q.start_at) {
-                        let dow = day.weekday().num_days_from_sunday();
-                        let today = if q.daily { q.days_mask & (1 << dow) != 0 } else { q.once_date.date_naive() == day };
-                        if today && q.last_start_fire.date_naive() != day {
-                            q.last_start_fire = now - chrono::Duration::days((now.date_naive() - day).num_days());
-                            start.push(q.name.clone());
-                        }
+            for q in &mut st.queues {
+                if q.running {
+                    if let Some(day) = scheduled_stop(q, wall, previous) {
+                        q.last_stop_slot = Some(day);
+                        q.last_stop_fire = now;
+                        stop.push(q.name.clone());
                     }
-                }
-                if q.stop_at_enabled && q.running {
-                    if let Some(day) = due(&q.stop_at) {
-                        if q.last_stop_fire.date_naive() != day {
-                            q.last_stop_fire = now - chrono::Duration::days((now.date_naive() - day).num_days());
-                            stop.push(q.name.clone());
-                        }
-                    }
+                } else if let Some(day) = scheduled_start(q, wall) {
+                    q.last_start_slot = Some(day);
+                    q.last_start_fire = now;
+                    start.push((q.name.clone(), day));
                 }
             }
         }
-        for n in &start {
-            self.start_queue(n);
+        for (name, day) in &start {
+            self.start_queue(name);
+            if let Some(q) = self.st.lock().queues.iter_mut().find(|q| &q.name == name) {
+                q.schedule_slot = Some(*day);
+            }
         }
-        for n in &stop {
-            self.stop_queue(n);
-        }
+        for name in &stop { self.stop_queue(name); }
         if !start.is_empty() || !stop.is_empty() {
-            self.mark_dirty();
+            // Persist the slot guard immediately, including an overnight slot's starting date.
+            self.save();
         }
     }
 
@@ -1020,6 +1247,15 @@ impl Manager {
 
     pub fn tick(self: &Arc<Self>) {
         let tick = self.tick_no.fetch_add(1, Ordering::Relaxed) + 1;
+        if tick.is_multiple_of(60) && !self.exiting.load(Ordering::Relaxed) {
+            crate::notify::tick(self);
+        }
+        if tick.is_multiple_of(4) && !self.exiting.load(Ordering::Relaxed) {
+            if let Ok(mut watcher) = self.watched.clone().try_lock_owned() {
+                let mgr = self.clone();
+                tauri::async_runtime::spawn(async move { watcher.scan(&mgr, Instant::now(), true).await; });
+            }
+        }
         let now = Instant::now();
         let settings = self.settings();
         self.refresh_limits();
@@ -1087,7 +1323,7 @@ impl Manager {
                 }
             }
             for it in st.items.iter_mut() {
-                if !runs.iter().any(|r| r.id == it.id) && !it.speed_history.is_empty() {
+                if !runs.iter().any(|r| r.id == it.id) && (!it.speed_history.is_empty() || it.seeding) {
                     it.push_speed(0.0);
                 }
             }
@@ -1247,13 +1483,13 @@ fn row_json(it: &Item, running: bool, s: &Settings) -> Value {
     } else if downloading {
         format!("{}/{}", it.active_connections, it.connections)
     } else {
-        it.connections.to_string()
+        String::new()
     };
     let ratio = if !it.is_torrent || it.downloaded <= 0 { String::new() } else if it.ratio() >= 9999.0 { "∞".into() } else { format!("{:.2}", it.ratio()) };
     let icon = crate::covers::icon_url(it, s);
     json!({
         "id": it.id,
-        "name": it.file_name,
+        "name": it.file_name, "title": crate::covers::display_title(it),
         "url": it.url,
         "folder": it.save_folder,
         "path": it.full_path(),
@@ -1292,6 +1528,7 @@ fn row_json(it: &Item, running: bool, s: &Settings) -> Value {
         "lastActivity": it.last_activity_at.as_ref().map(fmt::ago).unwrap_or_default(),
         "added": it.added_at.format("%b %d %H:%M").to_string(),
         "addedTs": it.added_at.timestamp(),
+        "completed": it.completed_at.map(|t| t.format("%b %d %H:%M").to_string()),
         "torrent": it.is_torrent,
         "seeding": it.seeding,
         "video": it.is_video,
@@ -1308,6 +1545,7 @@ fn row_json(it: &Item, running: bool, s: &Settings) -> Value {
         "uploaded": it.total_uploaded,
         "icon": icon,
         "cover": crate::covers::cover_url(it, s),
+        "game": crate::covers::is_game(it), "artColor": it.art_color, "banner": crate::covers::banner_url(it, s),
         "throttled": it.throttled,
     })
 }
@@ -1315,6 +1553,258 @@ fn row_json(it: &Item, running: bool, s: &Settings) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wall(value: &str) -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M").unwrap()
+    }
+
+    #[test]
+    fn scheduler_catches_up_only_inside_the_selected_slot() {
+        let mut q = QueueDef { start_at_enabled: true, stop_at_enabled: true, days_mask: 1 << 1, ..Default::default() };
+        let monday = wall("2026-11-02 02:00").date();
+        for time in ["2026-11-02 02:00", "2026-11-02 04:40", "2026-11-02 07:59"] {
+            assert_eq!(scheduled_start(&q, wall(time)), Some(monday));
+        }
+        for time in ["2026-11-02 01:59", "2026-11-02 08:00", "2026-11-02 18:00", "2026-11-03 04:00"] {
+            assert_eq!(scheduled_start(&q, wall(time)), None);
+        }
+        q.last_start_slot = Some(monday);
+        q = serde_json::from_value(serde_json::to_value(q).unwrap()).unwrap();
+        assert_eq!(scheduled_start(&q, wall("2026-11-02 05:00")), None);
+        q.last_start_slot = None;
+        q.last_start_fire = parse_when("2026-11-02T02:00:00").unwrap();
+        assert_eq!(scheduled_start(&q, wall("2026-11-02 05:00")), None);
+        q.last_start_fire = min_when();
+        q.stop_at_enabled = false;
+        assert_eq!(scheduled_start(&q, wall("2026-11-02 23:59")), Some(monday));
+        assert_eq!(scheduled_start(&q, wall("2026-11-03 00:01")), Some(monday));
+        assert_eq!(scheduled_start(&q, wall("2026-11-03 02:00")), None);
+        q.start_at = "invalid".into();
+        assert_eq!(scheduled_start(&q, wall("2026-11-02 03:00")), None);
+    }
+
+    #[test]
+    fn scheduler_overnight_slots_use_the_start_day_and_once_date() {
+        let mut q = QueueDef { start_at_enabled: true, start_at: "22:00".into(), stop_at_enabled: true,
+            stop_at: "02:00".into(), days_mask: 1 << 1, ..Default::default() };
+        let monday = wall("2026-11-02 22:00").date();
+        assert_eq!(scheduled_start(&q, wall("2026-11-03 01:59")), Some(monday));
+        assert_eq!(scheduled_start(&q, wall("2026-11-03 02:00")), None);
+        assert_eq!(scheduled_start(&q, wall("2026-11-03 22:00")), None);
+        q.daily = false;
+        q.once_date = parse_when("2026-11-02T00:00:00").unwrap();
+        assert_eq!(scheduled_start(&q, wall("2026-11-03 01:00")), Some(monday));
+        q.last_start_slot = Some(monday);
+        assert_eq!(scheduled_start(&q, wall("2026-11-03 01:00")), None);
+        q.running = true;
+        q.schedule_slot = Some(monday);
+        q = serde_json::from_value(serde_json::to_value(q).unwrap()).unwrap();
+        assert_eq!(scheduled_stop(&q, wall("2026-11-03 04:00"), Some(wall("2026-11-02 23:00"))), Some(monday.succ_opt().unwrap()));
+        q.last_stop_slot = Some(monday.succ_opt().unwrap());
+        assert_eq!(scheduled_stop(&q, wall("2026-11-03 04:01"), Some(wall("2026-11-02 23:00"))), None);
+    }
+
+    #[test]
+    fn scheduler_dst_gaps_repeated_hours_and_sleep_do_not_duplicate_slots() {
+        let mut q = QueueDef { start_at_enabled: true, start_at: "02:30".into(), stop_at_enabled: true, ..Default::default() };
+        // A missing wall-clock hour catches up as soon as the clock advances into the window.
+        let spring = wall("2026-03-29 03:00");
+        assert_eq!(scheduled_start(&q, spring), Some(spring.date()));
+        q.last_start_slot = Some(spring.date());
+        assert_eq!(scheduled_start(&q, wall("2026-03-29 03:30")), None);
+        let autumn = wall("2026-10-25 02:45");
+        assert_eq!(scheduled_start(&q, autumn), Some(autumn.date()));
+        q.last_start_slot = Some(autumn.date());
+        assert_eq!(scheduled_start(&q, wall("2026-10-25 02:30")), None);
+        assert_eq!(scheduled_start(&q, wall("2026-10-25 02:59")), None);
+        q.schedule_slot = Some(autumn.date());
+        assert_eq!(scheduled_stop(&q, wall("2026-10-26 11:00"), Some(autumn)), Some(wall("2026-10-26 08:00").date()));
+        q.schedule_slot = None;
+        // A queue manually started after a missed stop time waits for the next stop.
+        assert_eq!(scheduled_stop(&q, wall("2026-10-26 11:01"), Some(wall("2026-10-26 11:00"))), None);
+    }
+
+    #[test]
+    fn queue_idle_policy_and_completion_events_are_consistent() {
+        let mgr = Manager::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        mgr.set_ui(Box::new(move |event, _| captured.lock().push(event.to_string())));
+        let done = Item { queue_name: "q".into(), status: DlStatus::Completed, ..Default::default() };
+        {
+            let mut st = mgr.st.lock();
+            st.queues = vec![QueueDef { name: "q".into(), running: true, stop_when_empty: false,
+                started_ids: HashSet::from([done.id.clone()]), ..Default::default() }];
+            st.items = vec![done];
+        }
+        mgr.pump_queues();
+        mgr.pump_queues();
+        assert!(mgr.st.lock().queues[0].running);
+        assert!(mgr.st.lock().queues[0].finish_notified);
+        let saved = serde_json::to_value(&mgr.st.lock().queues[0]).unwrap();
+        let restored: QueueDef = serde_json::from_value(saved).unwrap();
+        assert!(restored.finish_notified);
+        assert!(!restored.running);
+        assert_eq!(events.lock().iter().filter(|e| *e == "toast").count(), 1);
+        mgr.start_queue("q");
+        assert!(mgr.st.lock().queues[0].finish_notified);
+        mgr.st.lock().queues[0].stop_when_empty = true;
+        mgr.pump_queues();
+        assert!(!mgr.st.lock().queues[0].running);
+        assert_eq!(events.lock().iter().filter(|e| *e == "toast").count(), 1);
+        mgr.start_queue("missing");
+        assert!(mgr.st.lock().items.iter().all(|i| i.status == DlStatus::Completed));
+        mgr.st.lock().items.clear();
+        mgr.start_queue("q");
+        assert!(!mgr.st.lock().queues[0].running);
+        assert_eq!(events.lock().iter().filter(|e| *e == "toast").count(), 1);
+    }
+
+    #[test]
+    fn queue_retries_are_opt_in_bounded_delayed_and_preserve_progress() {
+        let mgr = Manager::new();
+        let it = Item { queue_name: "q".into(), status: DlStatus::Error, downloaded: 1234, ..Default::default() };
+        let run = Run::test_run(&it.id);
+        {
+            let mut st = mgr.st.lock();
+            st.settings.notify_on_complete = false;
+            st.queues = vec![QueueDef { name: "q".into(), running: true, stop_when_empty: false, ..Default::default() }];
+            st.items = vec![it.clone()];
+        }
+        mgr.on_ended(&run);
+        assert_eq!(mgr.item(&it.id).unwrap().status, DlStatus::Error);
+        mgr.st.lock().queues[0].retry_count = 2;
+        mgr.st.lock().queues[0].retry_delay_sec = 120;
+        for attempt in 1..=2 {
+            let before = Local::now();
+            mgr.on_ended(&run);
+            let retried = mgr.item(&it.id).unwrap();
+            assert_eq!(retried.status, DlStatus::Queued);
+            assert_eq!(retried.retry_count, attempt);
+            assert_eq!(retried.downloaded, 1234);
+            assert!(retried.not_before.unwrap() >= before + chrono::Duration::seconds(120));
+            assert!(!mgr.is_running(&it.id));
+            mgr.with_item(&it.id, |i| i.status = DlStatus::Error);
+        }
+        mgr.on_ended(&run);
+        assert_eq!(mgr.item(&it.id).unwrap().status, DlStatus::Error);
+        assert_eq!(mgr.item(&it.id).unwrap().retry_count, 2);
+        mgr.st.lock().queues[0].running = false;
+        mgr.with_item(&it.id, |i| i.retry_count = 0);
+        mgr.on_ended(&run);
+        assert_eq!(mgr.item(&it.id).unwrap().status, DlStatus::Error);
+        mgr.st.lock().queues[0].running = true;
+        mgr.with_item(&it.id, |i| i.status = DlStatus::Paused);
+        mgr.on_ended(&run);
+        assert_eq!(mgr.item(&it.id).unwrap().status, DlStatus::Paused);
+    }
+
+    #[test]
+    fn remembered_add_queue_honours_explicit_context_and_deleted_queues() {
+        let mgr = Manager::new();
+        mgr.st.lock().queues = vec![QueueDef { name: "q".into(), ..Default::default() }, QueueDef::default()];
+        mgr.remember_add_queue("q");
+        assert_eq!(mgr.add_queue_choice(None), "q");
+        assert_eq!(mgr.add_queue_choice(Some("Main queue")), "Main queue");
+        assert_eq!(mgr.add_queue_choice(Some("")), "");
+        mgr.rename_queue("q", "renamed").unwrap();
+        assert_eq!(mgr.add_queue_choice(None), "renamed");
+        let saved = serde_json::to_value(mgr.settings()).unwrap();
+        let settings: Settings = serde_json::from_value(saved).unwrap();
+        assert_eq!(settings.last_add_queue, "renamed");
+        mgr.delete_queue("renamed");
+        assert_eq!(mgr.add_queue_choice(None), "");
+        mgr.remember_add_queue("missing");
+        assert_eq!(mgr.add_queue_choice(None), "");
+        let q: QueueDef = serde_json::from_value(json!({"Name": "old"})).unwrap();
+        assert!(q.stop_when_empty);
+        assert_eq!(q.retry_count, 0);
+        assert_eq!(q.retry_delay_sec, 20);
+        assert_eq!(Settings::default().max_manual_downloads, 3);
+    }
+
+    #[test]
+    fn legacy_retry_preferences_migrate_without_enabling_new_queues() {
+        let old = json!({"Name": "old"});
+        let explicit = json!({"Name": "new", "RetryCount": 0, "RetryDelaySec": 45});
+        let queues = load_queue_defs(vec![old.clone(), explicit], Some(4));
+        assert_eq!(queues[0].retry_count, 4);
+        assert_eq!(queues[0].retry_delay_sec, 20);
+        assert_eq!(queues[1].retry_count, 0);
+        assert_eq!(queues[1].retry_delay_sec, 45);
+        assert_eq!(load_queue_defs(vec![old], None)[0].retry_count, 0);
+        assert_eq!(QueueDef::default().retry_count, 0);
+    }
+
+    #[tokio::test]
+    async fn enabled_empty_queue_starts_later_additions_and_stop_cancels_retry_waits() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mgr = Manager::new();
+        {
+            let mut st = mgr.st.lock();
+            st.settings.lookup_covers_online = false;
+            st.settings.notify_on_complete = false;
+            st.queues = vec![QueueDef { name: "q".into(), stop_when_empty: false, ..Default::default() }];
+        }
+        mgr.start_queue("q");
+        assert!(mgr.st.lock().queues[0].running);
+        let it = Item { url: format!("http://{}/file", listener.local_addr().unwrap()), queue_name: "q".into(), ..Default::default() };
+        mgr.add(vec![it.clone()], false);
+        assert!(mgr.is_running(&it.id));
+        assert!(mgr.st.lock().queues[0].started_ids.contains(&it.id));
+        let delayed = Item { queue_name: "q".into(), status: DlStatus::Queued,
+            not_before: Some(Local::now() + chrono::Duration::seconds(60)), ..Default::default() };
+        mgr.st.lock().items.push(delayed.clone());
+        mgr.stop_queue("q");
+        assert!(!mgr.st.lock().queues[0].running);
+        assert_eq!(mgr.item(&delayed.id).unwrap().status, DlStatus::Paused);
+        mgr.pause(&it.id).await;
+        assert!(!mgr.is_running(&it.id));
+        mgr.pump_queues();
+        assert!(!mgr.is_running(&delayed.id));
+    }
+
+    #[tokio::test]
+    async fn manual_limit_queues_fifo_across_engines_and_pause_cancels_waiters() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        let mgr = Manager::new();
+        let mut ids = vec![];
+        {
+            let mut st = mgr.st.lock();
+            st.settings.max_manual_downloads = 3;
+            st.settings.lookup_covers_online = false;
+            for order in 0..5 {
+                let it = Item { url: url.clone(), queue_order: order, ..Default::default() };
+                ids.push(it.id.clone());
+                st.items.insert(0, it);
+            }
+        }
+        for (id, kind) in ids.iter().take(3).zip([Kind::Http, Kind::Torrent, Kind::Video]) {
+            let mut run = Run::test_run(id);
+            Arc::get_mut(&mut run).unwrap().kind = kind;
+            mgr.running.lock().insert(id.clone(), run);
+        }
+        mgr.start(&ids[3]);
+        mgr.start(&ids[4]);
+        assert_eq!(mgr.item(&ids[3]).unwrap().status, DlStatus::Queued);
+        assert_eq!(mgr.item(&ids[4]).unwrap().status, DlStatus::Queued);
+        let ended = mgr.run_of(&ids[0]).unwrap();
+        mgr.with_item(&ids[0], |i| i.status = DlStatus::Completed);
+        mgr.on_ended(&ended);
+        assert!(mgr.is_running(&ids[3]));
+        assert!(!mgr.is_running(&ids[4]));
+        mgr.pause(&ids[4]).await;
+        assert_eq!(mgr.item(&ids[4]).unwrap().status, DlStatus::Paused);
+        mgr.with_item(&ids[4], |i| i.status = DlStatus::Queued);
+        mgr.running.lock().remove(&ids[1]);
+        mgr.running.lock().remove(&ids[2]);
+        mgr.pause_all().await;
+        assert!(!mgr.is_running(&ids[3]));
+        assert!(!mgr.is_running(&ids[4]));
+        assert_eq!(mgr.item(&ids[4]).unwrap().status, DlStatus::Paused);
+        drop(listener);
+    }
 
     #[test]
     fn mixed_engines_share_global_and_queue_budgets_and_rebalance() {
@@ -1482,4 +1972,102 @@ mod tests {
         assert!(!path.exists());
         assert!(Manager::take_update_resume(&path).is_none());
     }
+    #[test]
+    fn edited_future_schedule_rearms_today_without_repeating_past_or_unchanged_slots() {
+        let now = chrono::NaiveDateTime::parse_from_str("2026-10-30 12:00", "%Y-%m-%d %H:%M").unwrap();
+        let old = QueueDef { start_at_enabled: true, start_at: "09:00".into(), daily: true,
+            days_mask: 127, last_start_slot: Some(now.date()), last_start_fire: Local::now(), ..Default::default() };
+        let mut saved = old.clone();
+        preserve_queue_runtime(&mut saved, &old, now);
+        assert_eq!(scheduled_start(&saved, now), None);
+        saved.start_at = "08:00".into();
+        preserve_queue_runtime(&mut saved, &old, now);
+        assert_eq!(scheduled_start(&saved, now), None);
+        saved.start_at = "13:00".into();
+        preserve_queue_runtime(&mut saved, &old, now);
+        assert_eq!(scheduled_start(&saved, now), None);
+        assert_eq!(scheduled_start(&saved, now + chrono::Duration::hours(1)), Some(now.date()));
+        saved.start_at = old.start_at.clone(); saved.days_mask = 1;
+        preserve_queue_runtime(&mut saved, &old, now);
+        assert_eq!(saved.last_start_slot, old.last_start_slot);
+        saved.start_at = "14:00".into(); saved.days_mask = 127;
+        preserve_queue_runtime(&mut saved, &old, now);
+        assert_eq!(scheduled_start(&saved, now + chrono::Duration::hours(2)), Some(now.date()));
+    }
+
+    #[test]
+    fn queue_rename_preserves_shared_limiter_and_rejects_duplicates_atomically() {
+        let mgr = Manager::new();
+        let item = Item { queue_name: "old".into(), ..Default::default() };
+        { let mut st = mgr.st.lock(); st.items = vec![item.clone()];
+          st.queues = vec![QueueDef { name: "old".into(), ..Default::default() }, QueueDef { name: "taken".into(), ..Default::default() }]; }
+        let limiter = mgr.queue_limiter("old").unwrap(); limiter.set(12345);
+        assert!(mgr.rename_queue("old", "TAKEN").is_err());
+        assert_eq!(mgr.item(&item.id).unwrap().queue_name, "old");
+        mgr.rename_queue("old", "new").unwrap();
+        let renamed = mgr.queue_limiter("new").unwrap();
+        assert!(Arc::ptr_eq(&limiter, &renamed)); assert_eq!(renamed.get(), 12345);
+        assert!(!mgr.queue_limiters.lock().contains_key("old"));
+        assert_eq!(mgr.item(&item.id).unwrap().queue_name, "new");
+    }
+
+    #[test]
+    fn speed_schedule_uses_selected_start_day_across_midnight_and_roundtrips() {
+        let mut s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.schedule_days_mask, 127); assert_eq!(s.existing_file_policy, "Number"); assert!(s.incomplete_folder.is_empty());
+        s.speed_schedule_enabled = true; s.schedule_days_mask = 1 << 5; s.schedule_from = "23:00".into(); s.schedule_to = "07:00".into();
+        let at = |v| chrono::NaiveDateTime::parse_from_str(v, "%Y-%m-%d %H:%M").unwrap();
+        for (time, active) in [("2026-10-30 22:59", false), ("2026-10-30 23:00", true), ("2026-10-31 06:59", true), ("2026-10-31 07:00", false), ("2026-10-31 23:00", false)] {
+            assert_eq!(Manager::schedule_active_at(&s, at(time)), active, "{time}");
+        }
+        s.schedule_days_mask = 0; assert!(!Manager::schedule_active_at(&s, at("2026-10-30 23:01")));
+        s.proxy_mode = "HTTP".into(); s.proxy_host = "example.invalid".into(); s.proxy_password = "secret".into(); s.existing_file_policy = "Ask".into();
+        let restored: Settings = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(restored.proxy_password, "secret"); assert_eq!(restored.existing_file_policy, "Ask"); assert_eq!(restored.schedule_days_mask, 0);
+    }
+
+    #[test]
+    fn disk_full_pauses_preserves_partial_data_and_never_uses_queue_retries() {
+        for e in [std::io::Error::from_raw_os_error(39), std::io::Error::from_raw_os_error(112), std::io::Error::from(std::io::ErrorKind::StorageFull)] {
+            let mgr = Manager::new();
+            let err = net::DlError::from(e);
+            assert_eq!(err.kind, net::ErrKind::DiskFull); assert!(!err.retryable());
+            let mut it = Item { queue_name: "q".into(), status: DlStatus::Downloading, downloaded: 12345, ..Default::default() };
+            err.apply_download_error(&mut it);
+            assert_eq!(it.status, DlStatus::Paused); assert!(it.error_message.contains("Free some space, then resume"));
+            assert!(it.status_text().contains("Free some space, then resume"));
+            let run = Run::test_run(&it.id);
+            { let mut st = mgr.st.lock(); st.settings.notify_on_complete = false; st.items = vec![it.clone()];
+              st.queues = vec![QueueDef { name: "q".into(), running: true, retry_count: 100, ..Default::default() }]; }
+            mgr.on_ended(&run);
+            let paused = mgr.item(&it.id).unwrap();
+            assert_eq!(paused.status, DlStatus::Paused); assert_eq!(paused.retry_count, 0);
+            assert_eq!(paused.downloaded, 12345); assert!(paused.not_before.is_none());
+        }
+    }
+
+    #[test]
+    fn failed_queue_notifies_once_without_post_action_and_success_waits_for_other_work() {
+        let mgr = Manager::new(); let events = Arc::new(Mutex::new(Vec::new())); let log = events.clone();
+        mgr.set_ui(Box::new(move |e, p| log.lock().push((e.to_owned(), p))));
+        let it = Item { queue_name: "q".into(), status: DlStatus::Error, ..Default::default() };
+        { let mut st = mgr.st.lock(); st.settings.notify_on_complete = true; st.items = vec![it.clone()];
+          st.queues = vec![QueueDef { name: "q".into(), running: true, post_action: PostAction::Shutdown,
+            started_ids: HashSet::from([it.id.clone()]), ..Default::default() }]; }
+        mgr.pump_queues(); mgr.pump_queues();
+        assert_eq!(events.lock().iter().filter(|(e, p)| e == "toast" && p["body"].as_str().unwrap_or("").contains("1 failed")).count(), 1);
+        assert!(!events.lock().iter().any(|(e, _)| e == "countdown"));
+        mgr.with_item(&it.id, |i| i.status = DlStatus::Completed);
+        { let mut st = mgr.st.lock(); st.queues[0].running = true; st.queues[0].finish_notified = false;
+          st.items.push(Item { status: DlStatus::Downloading, ..Default::default() }); }
+        mgr.pump_queues();
+        assert!(!events.lock().iter().any(|(e, _)| e == "countdown"));
+        assert!(mgr.has_pending_downloads());
+        { let mut st = mgr.st.lock(); st.items.pop(); st.queues[0].running = true; st.queues[0].finish_notified = false; }
+        assert!(!mgr.has_pending_downloads()); mgr.pump_queues();
+        assert_eq!(events.lock().iter().filter(|(e, _)| e == "countdown").count(), 1);
+        let waiting = Item { status: DlStatus::Queued, not_before: Some(Local::now() + chrono::Duration::hours(1)), ..Default::default() };
+        mgr.st.lock().items.push(waiting); assert!(mgr.has_pending_downloads());
+    }
+
 }

@@ -36,6 +36,8 @@ pub struct ConnectionOptions {
     // socks5://[username:password@]host:port
     // If set, all outgoing connections will go through the proxy over TCP.
     pub proxy_url: Option<String>,
+    // FluxDM patch: optionally connect directly to private and loopback peers.
+    pub proxy_bypass_local: bool,
     // TCP outgoing connections are enabled by default
     pub enable_tcp: bool,
     pub peer_opts: Option<PeerConnectionOptions>,
@@ -46,6 +48,7 @@ impl Default for ConnectionOptions {
         Self {
             enable_tcp: true,
             proxy_url: None,
+            proxy_bypass_local: false,
             peer_opts: None,
         }
     }
@@ -62,9 +65,18 @@ pub(crate) struct SocksProxyConfig {
 pub(crate) struct StreamConnectorArgs {
     pub enable_tcp: bool,
     pub socks_proxy_config: Option<SocksProxyConfig>,
+    pub proxy_bypass_local: bool,
     pub utp_socket: Option<Arc<UtpSocketUdp>>,
     pub bind_device: Option<BindDevice>,
     pub ipv4_only: bool,
+}
+
+// FluxDM patch: the same local ranges offered by the HTTP proxy setting.
+fn local_address(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        std::net::IpAddr::V6(ip) => ip.is_loopback() || (ip.segments()[0] & 0xfe00 == 0xfc00) || (ip.segments()[0] & 0xffc0 == 0xfe80) || ip.to_ipv4_mapped().is_some_and(|v| local_address(v.into())),
+    }
 }
 
 impl SocksProxyConfig {
@@ -75,9 +87,11 @@ impl SocksProxyConfig {
         }
         let host = url.host_str().context("missing host")?;
         let port = url.port().context("missing port")?;
-        let up = url
-            .password()
-            .map(|p| (url.username().to_owned(), p.to_owned()));
+        // FluxDM patch: decode URL credentials before SOCKS authentication.
+        let up = match url.password() {
+            Some(p) => Some((urlencoding::decode(url.username())?.into_owned(), urlencoding::decode(p)?.into_owned())),
+            None => None,
+        };
         Ok(Self {
             host: host.to_owned(),
             port,
@@ -128,6 +142,7 @@ gen_stats!(ConnectStatsAtomic ConnectStatsSnapshot, [], [
 #[derive(Debug)]
 pub(crate) struct StreamConnector {
     proxy_config: Option<SocksProxyConfig>,
+    proxy_bypass_local: bool,
     enable_tcp: bool,
     bind_device: Option<BindDevice>,
     utp_socket: Option<Arc<librqbit_utp::UtpSocketUdp>>,
@@ -153,6 +168,7 @@ impl StreamConnector {
 
         Ok(Self {
             proxy_config: config.socks_proxy_config,
+            proxy_bypass_local: config.proxy_bypass_local,
             enable_tcp: config.enable_tcp,
             utp_socket: config.utp_socket,
             bind_device: config.bind_device,
@@ -226,7 +242,7 @@ impl StreamConnector {
             )));
         }
 
-        if let Some(proxy) = self.proxy_config.as_ref() {
+        if let Some(proxy) = self.proxy_config.as_ref().filter(|_| !(self.proxy_bypass_local && local_address(addr.ip()))) {
             let (r, w) = self
                 .with_stat(ConnectionKind::Socks, addr.is_ipv6(), proxy.connect(addr))
                 .await?;

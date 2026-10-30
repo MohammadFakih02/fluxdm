@@ -35,6 +35,11 @@ struct CachedMeta {
 
 #[derive(Default)]
 pub struct Service {
+    tick_gate: tokio::sync::Mutex<()>,
+    seed_clock: Mutex<HashMap<String, Instant>>,
+    recheck_gate: Arc<tokio::sync::Mutex<()>>,
+    operations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    checks: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
     session: tokio::sync::Mutex<Option<Arc<Session>>>,
     live: Mutex<Option<Arc<Session>>>,
     seed_baseline: Mutex<HashMap<String, u64>>,
@@ -112,7 +117,46 @@ fn rate(kbps_bytes: i64) -> Option<NonZeroU32> {
 }
 
 fn anyhow_err(e: anyhow::Error) -> DlError {
+    if e.chain().filter_map(|e| e.downcast_ref::<std::io::Error>()).any(net::is_disk_full) {
+        return DlError::disk_full("");
+    }
     DlError::transient(format!("{e:#}"))
+}
+
+pub fn tracker_lines(text: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let u = url::Url::parse(line).map_err(|_| "Each tracker must be an HTTP, HTTPS or UDP URL.".to_string())?;
+        if !matches!(u.scheme(), "http" | "https" | "udp") || u.host_str().is_none() || !u.username().is_empty() || u.password().is_some() {
+            return Err("Each tracker must be an HTTP, HTTPS or UDP URL without login details.".into());
+        }
+        let value = u.to_string();
+        if !out.contains(&value) { out.push(value); }
+    }
+    Ok(out)
+}
+
+/// Case-insensitive filename globs; metadata names never include the storage marker.
+pub fn excluded(path: &str, patterns: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_lowercase();
+    patterns.lines().map(str::trim).filter(|p| !p.is_empty()).any(|pattern| {
+        let p: Vec<char> = pattern.to_lowercase().chars().collect();
+        let n: Vec<char> = name.chars().collect();
+        let (mut i, mut j, mut star, mut retry) = (0, 0, None, 0);
+        while j < n.len() {
+            if i < p.len() && (p[i] == '?' || p[i] == n[j]) { i += 1; j += 1; }
+            else if i < p.len() && p[i] == '*' { star = Some(i); i += 1; retry = j; }
+            else if let Some(s) = star { retry += 1; j = retry; i = s + 1; }
+            else { return false; }
+        }
+        while i < p.len() && p[i] == '*' { i += 1; }
+        i == p.len()
+    })
+}
+
+fn seed_limit_reached(s: &Settings, ratio: f64, seconds: f64) -> bool {
+    s.torrent_seed_ratio <= 0.0 || ratio >= s.torrent_seed_ratio
+        || (s.torrent_seed_minutes > 0 && seconds >= f64::from(s.torrent_seed_minutes) * 60.0)
 }
 
 /// A parsed .torrent: name, files, info hash, trackers.
@@ -134,9 +178,12 @@ pub fn parse(bytes: &[u8]) -> DlResult<Meta> {
     let t = librqbit::torrent_from_bytes(bytes).map_err(|_| bad())?;
     let multi = t.info.data.files.is_some();
     let info = t.info.data.clone().validate().map_err(|_| bad())?;
-    let name = info.name().map(|n| n.into_owned()).unwrap_or_else(|| "Torrent".into());
+    let name = librqbit::safe_path::component(&info.name().map(|n| n.into_owned()).unwrap_or_else(|| "Torrent".into()));
     // Every file, padding included, so indexes match the engine's (only_files / file_progress).
-    let files: Vec<(String, u64)> = info.iter_file_details().map(|fd| (fd.filename.to_string(), fd.len)).collect();
+    // The same cleaning and numbering as the engine, so both agree on every file's path.
+    let mut paths: Vec<PathBuf> = info.iter_file_details().map(|fd| librqbit::safe_path::path(fd.filename.iter_components())).collect();
+    librqbit::safe_path::unique(&mut paths);
+    let files: Vec<(String, u64)> = paths.iter().zip(info.iter_file_details()).map(|(p, fd)| (p.to_string_lossy().into_owned(), fd.len)).collect();
     let padding: Vec<bool> = info.iter_file_details().map(|fd| fd.attrs().padding).collect();
     let mut trackers: Vec<String> = vec![];
     let mut tiers: Vec<usize> = vec![];
@@ -173,13 +220,25 @@ pub fn source_hash(source: &str) -> Option<String> {
 /// Where a torrent's files go: a multi-file torrent gets its own folder (like qBittorrent/MonoTorrent did).
 fn output_folder(it: &Item, meta: &Meta) -> String {
     if meta.multi {
-        Path::new(&it.save_folder).join(net::sanitize(&meta.name)).to_string_lossy().into_owned()
+        Path::new(it.storage_folder()).join(&meta.name).to_string_lossy().into_owned()
     } else {
-        it.save_folder.clone()
+        it.storage_folder().to_string()
     }
 }
 
 impl Service {
+    pub fn operation(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.operations.lock().entry(id.to_owned()).or_default().clone()
+    }
+
+    pub fn cancel_check(&self, id: &str) {
+        if let Some(cancel) = self.checks.lock().get(id) { cancel.cancel(); }
+    }
+
+    pub fn begin_check(&self, id: &str) {
+        self.checks.lock().insert(id.to_owned(), tokio_util::sync::CancellationToken::new());
+    }
+
     pub fn session_now(&self) -> Option<Arc<Session>> {
         self.live.lock().clone()
     }
@@ -210,21 +269,29 @@ impl Service {
         };
         let s = mgr.settings();
         // µTP reaches peers TCP can't (and is what most of the swarm speaks); the .NET build's switch still applies.
-        let utp = extra_bool(&s, "TorrentEnableUtp", true);
+        let utp = extra_bool(&s, "TorrentEnableUtp", true) && s.proxy_mode != "SOCKS5";
         let peer_limit = extra_num(&s, "TorrentMaxConnectionsPerTorrent", 200) as usize;
         *self.port.lock() = port;
         *self.utp.lock() = utp;
         *self.peer_limit.lock() = peer_limit;
-        let opts = SessionOptions {
-            dht: Some(DhtSessionConfig {
+        let proxy_url = if s.proxy_mode == "SOCKS5" { net::proxy_url(&s).map_err(DlError::fatal)?.map(|u| u.replacen("socks5h:", "socks5:", 1)) } else { None };
+        let blocklist_url = blocklist_source(&s.torrent_blocklist_url).map_err(DlError::fatal)?;
+        let opts = |dht: bool| SessionOptions {
+            connect: Some(librqbit::ConnectionOptions { proxy_bypass_local: s.proxy_bypass_local, proxy_url: proxy_url.clone(), ..Default::default() }),
+            dht: (s.torrent_enable_dht && dht).then(|| DhtSessionConfig {
                 persistence: Some(DhtPersistenceConfig { config_filename: Some(dir().join("dht.json")), ..Default::default() }),
                 ..Default::default()
             }),
+            blocklist_url: blocklist_url.clone(),
+            disable_local_service_discovery: !s.torrent_enable_local_discovery,
+            ipv4_only: s.torrent_ipv4_only,
             fastresume: true,
+            defer_persistence_restore: true,
             persistence: Some(SessionPersistenceConfig::Json { folder: Some(dir().join("session")) }),
             listen: Some(ListenerOptions {
                 mode: if utp { ListenerMode::TcpAndUtp } else { ListenerMode::TcpOnly },
-                listen_addr: (std::net::Ipv6Addr::UNSPECIFIED, port as u16).into(),
+                listen_addr: if s.torrent_ipv4_only { (std::net::Ipv4Addr::UNSPECIFIED, port as u16).into() }
+                    else { (std::net::Ipv6Addr::UNSPECIFIED, port as u16).into() },
                 enable_upnp_port_forwarding: upnp,
                 ..Default::default()
             }),
@@ -232,7 +299,23 @@ impl Service {
             client_name_and_version: Some(format!("FluxDM {}", env!("CARGO_PKG_VERSION"))),
             ..Default::default()
         };
-        let session = Session::new_with_opts(PathBuf::from(default_folder), opts).await.map_err(anyhow_err)?;
+        let session = match Session::new_with_opts(PathBuf::from(&default_folder), opts(true)).await {
+            Ok(s) => s,
+            // The saved DHT state names a UDP port something else already uses (another program, or a second
+            // FluxDM with a copy of this data folder). Start DHT afresh on a free port; if even that fails, run
+            // without DHT (trackers still find peers) instead of failing every torrent.
+            Err(e) if s.torrent_enable_dht && format!("{e:#}").to_lowercase().contains("dht") => {
+                let _ = std::fs::remove_file(dir().join("dht.json"));
+                match Session::new_with_opts(PathBuf::from(&default_folder), opts(true)).await {
+                    Ok(s) => s,
+                    Err(_) => {
+                        mgr.warn_toast("Torrents without DHT", "DHT couldn't open a network port, so torrents find peers through their trackers only this time.");
+                        Session::new_with_opts(PathBuf::from(&default_folder), opts(false)).await.map_err(anyhow_err)?
+                    }
+                }
+            }
+            Err(e) => return Err(anyhow_err(e)),
+        };
         // Torrents the session remembered start by themselves; only the ones FluxDM is running should.
         let handles: Vec<ManagedTorrentHandle> = session.with_torrents(|it| it.map(|(_, h)| h.clone()).collect());
         for h in handles {
@@ -256,7 +339,7 @@ impl Service {
 
     /// The .torrent bytes for a magnet link (asks peers via DHT/trackers), a .torrent web link or file,
     /// cached as a .torrent file in the data folder.
-    pub async fn resolve(&self, mgr: &Arc<Manager>, source: &str, headers: &str, status: impl Fn(&str)) -> DlResult<(Vec<u8>, String)> {
+    pub async fn resolve(&self, mgr: &Arc<Manager>, source: &str, headers: &str, trackers: &[String], status: impl Fn(&str)) -> DlResult<(Vec<u8>, String)> {
         let source = source.trim().trim_matches('"');
         std::fs::create_dir_all(dir())?;
         let bytes = if net::is_magnet(source) {
@@ -270,7 +353,7 @@ impl Service {
             status("getting the torrent's info from peers…");
             let session = self.session(mgr).await?;
             let resp = session
-                .add_torrent(AddTorrent::from_url(source), Some(AddTorrentOptions { list_only: true, ..Default::default() }))
+                .add_torrent(AddTorrent::from_url(source), Some(AddTorrentOptions { list_only: true, trackers: Some(trackers.to_vec()), ..Default::default() }))
                 .await
                 .map_err(anyhow_err)?;
             match resp {
@@ -303,12 +386,13 @@ impl Service {
 
     /// What the Add window shows about a torrent.
     pub async fn info(&self, mgr: &Arc<Manager>, source: &str, headers: &str) -> DlResult<Value> {
-        let (bytes, cached) = self.resolve(mgr, source, headers, |_| {}).await?;
+        let trackers = tracker_lines(&mgr.settings().torrent_always_trackers).map_err(DlError::fatal)?;
+        let (bytes, cached) = self.resolve(mgr, source, headers, &trackers, |_| {}).await?;
         let m = parse(&bytes)?;
         Ok(json!({
             "name": m.name,
             "size": m.size,
-            "files": m.files.iter().enumerate().map(|(i, (p, l))| json!({ "index": i, "path": p, "length": l })).collect::<Vec<_>>(),
+            "files": m.files.iter().enumerate().map(|(i, (p, l))| json!({ "index": i, "path": p, "length": l, "wanted": !excluded(p, &mgr.settings().torrent_skip_patterns) })).collect::<Vec<_>>(),
             "infoHash": m.hash,
             "cachedFile": cached,
         }))
@@ -335,7 +419,9 @@ impl Service {
             }
             return Ok(h);
         }
+        use librqbit::storage::StorageFactoryExt;
         let opts = AddTorrentOptions {
+            storage_factory: it.torrent_mark_unfinished.then(|| librqbit::storage::filesystem::FilesystemStorageFactory { mark_unfinished: true }.boxed()),
             paused,
             only_files: if only.len() == meta.files.len() { None } else { Some(only) },
             overwrite: true,
@@ -361,13 +447,20 @@ impl Service {
             let _ = s.delete(TorrentIdOrHash::Hash(h.info_hash()), delete_data).await;
             return;
         }
+        if let Ok(bytes) = std::fs::read(&it.torrent_file) {
+            if let Ok(meta) = parse(&bytes) {
+                let parts = librqbit::storage::filesystem::partfile_path(Path::new(&output_folder(it, &meta)), &meta.hash);
+                let _ = std::fs::remove_file(&parts);
+                if let Some(parent) = parts.parent() { let _ = std::fs::remove_dir(parent); }
+            }
+        }
         if delete_data {
             // Not loaded this session: delete exactly the files the torrent lists, never anything else.
             if let Ok(bytes) = std::fs::read(&it.torrent_file) {
                 if let Ok(meta) = parse(&bytes) {
                     let out = output_folder(it, &meta);
                     for (p, _) in &meta.files {
-                        let _ = std::fs::remove_file(Path::new(&out).join(p));
+                        let _ = std::fs::remove_file(existing_path(&Path::new(&out).join(p), it.torrent_mark_unfinished));
                     }
                     if meta.multi {
                         remove_empty_dirs(Path::new(&out));
@@ -393,6 +486,9 @@ impl Service {
         if it.seeding_limit_kbps < 0 || s.torrent_seeding_limit_kbps < 0 {
             return note("not shared (seeding limit is No upload)".into());
         }
+        if s.torrent_seed_minutes > 0 && it.seed_seconds >= f64::from(s.torrent_seed_minutes) * 60.0 {
+            return note("seeding time limit reached".into());
+        }
         if it.ratio() >= target {
             return note(format!("already shared {:.2}× (target {target})", it.ratio()));
         }
@@ -400,15 +496,8 @@ impl Service {
             return note("can't share: this torrent's info file is missing".into());
         };
         let folder = output_folder(&it, &meta);
-        let skipped: HashSet<i32> = it.skipped_files.iter().copied().collect();
-        let missing = meta
-            .files
-            .iter()
-            .enumerate()
-            .filter(|(i, (_, len))| *len > 0 && !skipped.contains(&(*i as i32)) && !meta.padding.get(*i).copied().unwrap_or(false))
-            .any(|(_, (p, len))| std::fs::metadata(Path::new(&folder).join(p)).map(|m| m.len() != *len).unwrap_or(true));
-        if missing {
-            return note("can't share: some of its files were moved or deleted (Force recheck to download them again)".into());
+        if wanted_files_missing(&it, &meta) {
+            return note(FILES_MISSING.into());
         }
         let r: DlResult<()> = async {
             let session = self.session(mgr).await?;
@@ -436,23 +525,65 @@ impl Service {
                 let _ = s.pause(&h).await;
             }
         }
+        self.seed_clock.lock().remove(id);
         mgr.with_item(id, |it| { it.note.clear(); it.seeding = false; it.upload_speed = 0.0; it.connected_peers = 0; });
     }
 
     /// Re-reads every piece already on disk and keeps only what verifies ("Force recheck"). The caller pauses
     /// the item first. Returns the verified share of the wanted files, 0–100.
     pub async fn recheck(&self, mgr: &Arc<Manager>, id: &str) -> DlResult<f64> {
+        self.recheck_with_timeout(mgr, id, Duration::from_secs(30 * 60)).await
+    }
+
+    async fn recheck_with_timeout(&self, mgr: &Arc<Manager>, id: &str, limit: Duration) -> DlResult<f64> {
+        let cancel = self.checks.lock().entry(id.to_owned()).or_default().clone();
+        let result = tokio::select! {
+            _ = cancel.cancelled() => Err(DlError::cancelled()),
+            guard = self.recheck_gate.clone().lock_owned() => {
+                let result = tokio::select! {
+                    _ = cancel.cancelled() => Err(DlError::cancelled()),
+                    result = tokio::time::timeout(limit, self.recheck_inner(mgr, id, &cancel)) =>
+                        result.unwrap_or_else(|_| Err(DlError::timeout("Torrent check timed out; partial data was kept. Try again."))),
+                };
+                if result.as_ref().is_err_and(|e| matches!(e.kind, ErrKind::Timeout | ErrKind::Cancelled)) {
+                    if let (Some(s), Some(it)) = (self.session_now(), mgr.item(id)) {
+                        let hash = if it.info_hash.is_empty() { source_hash(&it.torrent_file).unwrap_or_default() } else { it.info_hash };
+                        if let Some(h) = self.find(&hash) {
+                            // Return promptly while retaining the global slot until hashing actually stops.
+                            tauri::async_runtime::spawn(async move {
+                                let _guard = guard;
+                                let _ = s.pause(&h).await;
+                            });
+                        }
+                    }
+                }
+                result
+            }
+        };
+        self.checks.lock().remove(id);
+        result
+    }
+
+    async fn recheck_inner(&self, mgr: &Arc<Manager>, id: &str, cancel: &tokio_util::sync::CancellationToken) -> DlResult<f64> {
+        if cancel.is_cancelled() || mgr.exiting.load(Ordering::Relaxed) { return Err(DlError::cancelled()); }
         let it = mgr.item(id).ok_or_else(|| DlError::fatal("gone"))?;
         let bytes = std::fs::read(&it.torrent_file).map_err(|_| DlError::fatal("This torrent's info isn't known yet — start it once first"))?;
         let meta = parse(&bytes)?;
         let session = self.session(mgr).await?;
         if let Some(h) = self.find(&meta.hash) {
-            let _ = session.delete(TorrentIdOrHash::Hash(h.info_hash()), false).await;
+            session.detach(TorrentIdOrHash::Hash(h.info_hash())).await.map_err(anyhow_err)?;
         }
         let h = self.add(mgr, &session, bytes, &meta, &output_folder(&it, &meta), &it, 0, true).await?;
         loop {
+            if cancel.is_cancelled() || mgr.exiting.load(Ordering::Relaxed) {
+                let _ = session.pause(&h).await;
+                return Err(DlError::cancelled());
+            }
             let st = h.stats();
-            if matches!(st.state, librqbit::TorrentStatsState::Paused | librqbit::TorrentStatsState::Live | librqbit::TorrentStatsState::Error) {
+            if matches!(st.state, librqbit::TorrentStatsState::Error) {
+                return Err(if h.storage_full() { DlError::disk_full(&it.save_folder) } else { DlError::transient(st.error.unwrap_or_else(|| "Torrent check failed".into())) });
+            }
+            if matches!(st.state, librqbit::TorrentStatsState::Paused | librqbit::TorrentStatsState::Live) {
                 let pct = if st.total_bytes > 0 { st.progress_bytes as f64 * 100.0 / st.total_bytes as f64 } else { 0.0 };
                 return Ok(pct);
             }
@@ -468,7 +599,7 @@ impl Service {
         let paths = move_targets(&it, new_folder);
         check_move_targets(&paths)?;
         if let (Some(s), Some(h)) = (self.session_now(), self.find(&it.info_hash)) {
-            let _ = s.delete(TorrentIdOrHash::Hash(h.info_hash()), false).await;
+            s.detach_for_move(&h).await.map_err(anyhow_err)?;
         }
         move_paths(&paths)?;
         Ok(())
@@ -507,7 +638,7 @@ impl Service {
                         let have = stats.as_ref().and_then(|s| s.file_progress.get(i).copied()).unwrap_or(if it.status == DlStatus::Completed && !skipped.contains(&(i as i32)) { *len } else { 0 });
                         let pct = if *len > 0 { have as f64 * 100.0 / *len as f64 } else { 100.0 };
                         json!({
-                            "index": i, "path": p, "sizeText": fmt::size(*len as i64),
+                            "index": i, "path": p, "size": *len, "done": have.min(*len), "sizeText": fmt::size(*len as i64),
                             "progress": (pct * 10.0).round() / 10.0,
                             "wanted": !skipped.contains(&(i as i32)),
                             "priority": if skipped.contains(&(i as i32)) { 0 } else { it.file_priorities.get(&(i as i32)).copied().unwrap_or(PRIO_NORMAL) },
@@ -635,7 +766,19 @@ impl Service {
                     "turnover": librqbit::turnover_stats::dropped(), "connecting": ps.connecting, "queued": ps.queued, "dead": ps.dead,
                     "down": fmt::speed(l.download_speed.mbps * 1048576.0), "up": fmt::speed(l.upload_speed.mbps * 1048576.0) })
         });
-        json!({ "files": files, "trackers": trackers, "peers": peers, "live": summary, "hash": it.info_hash.to_lowercase() })
+        let pieces = self.session_now().zip(h.as_ref()).and_then(|(session, handle)| {
+            librqbit::Api::new(session, None).api_dump_haves(TorrentIdOrHash::Hash(handle.info_hash())).ok()
+        }).map(|(bits, total)| {
+            let have = bits.iter().take(total as usize).filter(|b| **b).count();
+            let groups = (total as usize).min(320);
+            let blocks: Vec<f64> = (0..groups).map(|i| {
+                let start = i * total as usize / groups;
+                let end = (i + 1) * total as usize / groups;
+                bits[start..end].count_ones() as f64 / (end - start) as f64
+            }).collect();
+            json!({ "total": total, "have": have, "blocks": blocks })
+        });
+        json!({ "files": files, "trackers": trackers, "peers": peers, "live": summary, "hash": it.info_hash.to_lowercase(), "pieces": pieces })
     }
 
     /// Turns one file of a torrent on or off (live if it's running).
@@ -716,6 +859,7 @@ impl Service {
     }
 
     pub async fn tick(&self, mgr: &Arc<Manager>) {
+        let Ok(_tick) = self.tick_gate.try_lock() else { return };
         let Some(session) = self.session_now() else { return };
         let s = mgr.settings();
         session.ratelimits.set_download_bps(None);
@@ -736,13 +880,15 @@ impl Service {
         let mut seeding = HashSet::new();
         for it in items.iter().filter(|i| i.status == DlStatus::Completed && !mgr.is_running(&i.id)) {
             mgr.with_item(&it.id, |x| { x.seeding = false; x.upload_speed = 0.0; x.connected_peers = 0; });
-            let Some(h) = self.find(&it.info_hash) else { continue };
+            let Some(h) = self.find(&it.info_hash) else { self.seed_clock.lock().remove(&it.id); continue };
             if h.is_paused() {
+                self.seed_clock.lock().remove(&it.id);
                 continue;
             }
             // Shared from disk but not all there (files changed since it finished): stop rather than download
             // behind a "Complete" row. Force recheck is the way to fetch what's missing.
             let now = h.stats();
+            if !matches!(now.state, librqbit::TorrentStatsState::Live) { self.seed_clock.lock().remove(&it.id); continue; }
             if matches!(now.state, librqbit::TorrentStatsState::Live) && !now.finished {
                 let _ = session.pause(&h).await;
                 mgr.with_item(&it.id, |x| x.note = "stopped sharing: some data on disk doesn't match (Force recheck downloads it again)".into());
@@ -757,6 +903,8 @@ impl Service {
                 b.insert(hex.clone(), sent);
                 sent.saturating_sub(base) as i64
             };
+            let clock = Instant::now();
+            let elapsed = self.seed_clock.lock().insert(it.id.clone(), clock).map(|t| clock.duration_since(t).as_secs_f64()).filter(|dt| *dt <= 5.0).unwrap_or(0.0);
             let target = s.torrent_seed_ratio;
             let (ratio, peers) = mgr
                 .with_item(&it.id, |x| {
@@ -764,16 +912,30 @@ impl Service {
                         x.total_uploaded += delta;
                         x.last_activity_at = Some(chrono::Local::now());
                     }
-                    x.active_seconds += 1.0;
+                    x.active_seconds += elapsed;
+                    x.seed_seconds += elapsed;
                     swarm(&h, x);
                     (x.ratio(), h.stats().live.map(|l| l.snapshot.peer_stats.live).unwrap_or(0))
                 })
                 .unwrap_or((0.0, 0));
+            if elapsed > 0.0 { mgr.mark_dirty(); }
             // A seeding limit of "No upload" (its own, or the one in Settings) means: don't share it once finished.
             // Kept loaded, it would only sit there as "seeding" while sending nothing, its ratio never growing.
             let no_seed = it.seeding_limit_kbps < 0 || s.torrent_seeding_limit_kbps < 0;
-            if target <= 0.0 || ratio >= target || no_seed {
+            let seconds = mgr.with_item(&it.id, |x| x.seed_seconds).unwrap_or(0.0);
+            let reached = seed_limit_reached(&s, ratio, seconds);
+            if reached || no_seed {
+                let operation = self.operation(&it.id);
+                let Ok(_guard) = operation.try_lock() else { continue };
                 let _ = session.pause(&h).await;
+                self.seed_clock.lock().remove(&it.id);
+                if reached && !no_seed && s.torrent_seed_action == "Remove" {
+                    self.remove(mgr, it, false).await;
+                    mgr.st.lock().items.retain(|x| x.id != it.id);
+                    mgr.save();
+                    mgr.push_list();
+                    continue;
+                }
                 mgr.with_item(&it.id, |x| {
                     x.note = if no_seed {
                         "not shared (seeding limit is No upload)".into()
@@ -793,6 +955,8 @@ impl Service {
             }
         }
         self.seed_baseline.lock().retain(|h, _| seeding.contains(h));
+        let ids: HashSet<_> = items.iter().map(|i| i.id.as_str()).collect();
+        self.seed_clock.lock().retain(|id, _| ids.contains(id.as_str()));
     }
 
     pub async fn shutdown(&self) {
@@ -805,6 +969,11 @@ impl Service {
         }
         let _ = tokio::time::timeout(Duration::from_secs(3), s.stop()).await;
     }
+}
+
+fn existing_path(path: &Path, mark: bool) -> PathBuf {
+    let marked = librqbit::storage::filesystem::marked_path(path);
+    if mark && marked.exists() { marked } else { path.to_path_buf() }
 }
 
 fn remove_empty_dirs(p: &Path) {
@@ -827,8 +996,15 @@ pub fn same_drive(a: &str, b: &str) -> bool {
 fn move_targets(it: &Item, folder: &str) -> Vec<(PathBuf, PathBuf)> {
     let meta = std::fs::read(&it.torrent_file).ok().and_then(|b| parse(&b).ok());
     match meta {
-        Some(m) if m.multi => vec![(PathBuf::from(output_folder(it, &m)), Path::new(folder).join(net::sanitize(&m.name)))],
-        Some(m) => m.files.iter().map(|(p, _)| (Path::new(&it.save_folder).join(p), Path::new(folder).join(p))).collect(),
+        Some(m) if m.multi => vec![(PathBuf::from(output_folder(it, &m)), Path::new(folder).join(&m.name))],
+        Some(m) => {
+            let mut paths: Vec<_> = m.files.iter().map(|(p, _)| { let from = existing_path(&Path::new(it.storage_folder()).join(p), it.torrent_mark_unfinished); let to = Path::new(folder).join(from.file_name().unwrap()); (from, to) }).collect();
+            let parts = librqbit::storage::filesystem::partfile_path(Path::new(it.storage_folder()), &m.hash);
+            if parts.exists() {
+                paths.push((parts, librqbit::storage::filesystem::partfile_path(Path::new(folder), &m.hash)));
+            }
+            paths
+        }
         None => vec![(PathBuf::from(it.full_path()), Path::new(folder).join(&it.file_name))],
     }
 }
@@ -862,6 +1038,20 @@ fn copy_path(from: &Path, to: &Path, created: &mut Vec<PathBuf>) -> std::io::Res
         dest.sync_all()?;
     }
     Ok(())
+}
+
+pub fn publish_file(from: &Path, to: &Path, overwrite: bool) -> std::io::Result<()> {
+    if !from.is_file() { return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "The unfinished file is missing")); }
+    if !overwrite { return move_paths(&[(from.to_path_buf(), to.to_path_buf())]); }
+    #[cfg(windows)] {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_COPY_ALLOWED, MOVEFILE_REPLACE_EXISTING};
+        let a: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let b: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe { MoveFileExW(PCWSTR(a.as_ptr()), PCWSTR(b.as_ptr()), MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING) }.map_err(std::io::Error::other)
+    }
+    #[cfg(not(windows))] { std::fs::copy(from, to)?; std::fs::remove_file(from) }
 }
 
 fn move_paths(paths: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
@@ -924,15 +1114,16 @@ pub async fn run(mgr: Arc<Manager>, run: Arc<Run>) {
     let mut handle: Option<ManagedTorrentHandle> = None;
     let r = go(&mgr, &run, &mut handle).await;
     let done = run.current.load(Ordering::Relaxed);
+    // The engine can take a while to pause a torrent that's still checking its files. The row shows Paused
+    // after at most 10 s; the engine finishes pausing it in the background.
     let pause = |h: &ManagedTorrentHandle| {
         let h = h.clone();
         let s = mgr.torrents.session_now();
         async move {
-            if let Some(s) = s {
-                if !h.is_paused() {
-                    let _ = s.pause(&h).await;
-                }
-            }
+            let Some(s) = s else { return };
+            if h.is_paused() { return; }
+            let job = tokio::spawn(async move { let _ = s.pause(&h).await; });
+            let _ = tokio::time::timeout(Duration::from_secs(10), job).await;
         }
     };
     match r {
@@ -944,6 +1135,7 @@ pub async fn run(mgr: Arc<Manager>, run: Arc<Run>) {
             mgr.with_item(&id, |it| {
                 it.downloaded = done;
                 it.note.clear();
+                it.error_message.clear();
                 it.set_status(DlStatus::Paused);
             });
         }
@@ -954,8 +1146,8 @@ pub async fn run(mgr: Arc<Manager>, run: Arc<Run>) {
             mgr.with_item(&id, |it| {
                 it.downloaded = done;
                 it.note.clear();
-                it.error_message = e.msg.clone();
-                it.set_status(DlStatus::Error);
+                e.apply_download_error(it);
+                if e.msg == FILES_MISSING { it.set_status(DlStatus::Paused); }
             });
         }
     }
@@ -970,6 +1162,17 @@ fn class_upload_limit(own: i32, global: i32, count: usize) -> Option<NonZeroU32>
     if own < 0 || global < 0 { return NO_UPLOAD; }
     let share = if global > 0 { (global as i64 * 1024 / count.max(1) as i64).max(2) } else { 0 };
     rate([own as i64 * 1024, share].into_iter().filter(|v| *v > 0).min().unwrap_or(0))
+}
+
+const FILES_MISSING: &str = "Files missing - Force recheck to download them again";
+
+fn wanted_files_missing(it: &Item, meta: &Meta) -> bool {
+    let folder = output_folder(it, meta);
+    meta.files.iter().enumerate().any(|(i, (path, len))| {
+        *len > 0 && !it.skipped_files.contains(&(i as i32))
+            && !meta.padding.get(i).copied().unwrap_or(false)
+            && std::fs::metadata(existing_path(&Path::new(&folder).join(path), it.torrent_mark_unfinished)).map(|m| !m.is_file() || m.len() != *len).unwrap_or(true)
+    })
 }
 
 async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentHandle>) -> DlResult<()> {
@@ -987,27 +1190,39 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentH
         mgr.with_item(&id, |it| it.error_message = s.to_string());
     };
     let (bytes, cached) = tokio::select! {
-        r = svc.resolve(mgr, &source, &it.headers, status) => r?,
+        r = svc.resolve(mgr, &source, &it.headers, &it.extra_trackers, status) => r?,
         _ = run.cancel.cancelled() => return Err(DlError::cancelled()),
     };
     let meta = parse(&bytes)?;
     if !mgr.claim_torrent_hash(&id, &meta.hash) {
         return Err(DlError::cancelled());
     }
+    mgr.with_item(&id, |x| {
+        if !x.torrent_skip_patterns.is_empty() {
+            for (i, (path, _)) in meta.files.iter().enumerate() {
+                if excluded(path, &x.torrent_skip_patterns) && !x.skipped_files.contains(&(i as i32)) { x.skipped_files.push(i as i32); }
+            }
+            x.torrent_skip_patterns.clear();
+        }
+    });
+    let it = mgr.item(&id).ok_or_else(DlError::cancelled)?;
     let skipped: HashSet<i32> = it.skipped_files.iter().copied().collect();
     let wanted: i64 = meta.files.iter().enumerate().filter(|(i, _)| !skipped.contains(&(*i as i32))).map(|(_, f)| f.1 as i64).sum();
     mgr.with_item(&id, |it| {
         it.torrent_file = cached.clone();
         it.info_hash = meta.hash.clone();
-        it.file_name = net::sanitize(&meta.name);
+        it.file_name = meta.name.clone();
         it.total_size = wanted;
         it.resumable = true;
         it.error_message.clear();
     });
     let it = mgr.item(&id).ok_or_else(DlError::cancelled)?;
     let folder = output_folder(&it, &meta);
+    if it.downloaded > 0 && wanted_files_missing(&it, &meta) {
+        return Err(DlError::fatal(FILES_MISSING));
+    }
     std::fs::create_dir_all(&folder)?;
-    if let Some(free) = crate::win::free_space(&it.save_folder) {
+    if let Some(free) = crate::win::free_space(it.storage_folder()) {
         let need = wanted - run.current.load(Ordering::Relaxed);
         if free < need + 64 * 1024 * 1024 {
             return Err(DlError::fatal(format!("Not enough space — needs {}, {} free", fmt::size(need), fmt::size(free))));
@@ -1017,12 +1232,27 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentH
     // The current share also applies before the first heartbeat.
     let own = own_down_limit(mgr, &it);
     run.started_limit.store(own, Ordering::Relaxed);
-    let session = svc.session(mgr).await?;
-    let h = svc.add(mgr, &session, bytes, &meta, &folder, &it, own, false).await?;
-    if h.is_paused() {
-        session.unpause(&h).await.map_err(anyhow_err)?;
-    }
+    // Pause must work at once, even while the engine is still starting (blocklist, DHT, restoring torrents):
+    // the start carries on in the background (stopping it halfway could leave ports open), this task stops waiting.
+    let m = mgr.clone();
+    let mut starting = tokio::spawn(async move { m.torrents.session(&m).await });
+    let session = tokio::select! {
+        r = &mut starting => r.map_err(|e| DlError::fatal(e.to_string()))??,
+        _ = run.cancel.cancelled() => return Err(DlError::cancelled()),
+    };
+    // Added paused and started afterwards: a pause during the add leaves it paused in the engine too.
+    let h = tokio::select! {
+        h = svc.add(mgr, &session, bytes, &meta, &folder, &it, own, true) => h?,
+        _ = run.cancel.cancelled() => return Err(DlError::cancelled()),
+    };
     *out = Some(h.clone());
+    if run.is_cancelled() { return Err(DlError::cancelled()); }
+    if h.is_paused() {
+        tokio::select! {
+            r = session.unpause(&h) => r.map_err(anyhow_err)?,
+            _ = run.cancel.cancelled() => return Err(DlError::cancelled()),
+        }
+    }
     mgr.with_item(&id, |it| it.set_status(DlStatus::Downloading));
 
     let (mut last_fetched, mut last_up) = (None::<u64>, None::<u64>);
@@ -1034,13 +1264,17 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentH
             _ = run.cancel.cancelled() => return Err(DlError::cancelled()),
         }
         let st = h.stats();
+        if matches!(st.state, librqbit::TorrentStatsState::Paused) {
+            return Err(DlError::cancelled());
+        }
         if let Some(err) = &st.error {
             if matches!(st.state, librqbit::TorrentStatsState::Error) {
-                return Err(DlError::transient(err.lines().next().unwrap_or(err).to_string()));
+                return Err(if h.storage_full() { DlError::disk_full(&it.save_folder) } else { DlError::transient(err.clone()) });
             }
         }
         let wanted_now: i64 = st.total_bytes as i64;
-        if wanted_now > 0 && wanted_now != wanted {
+        // Checking counters describe bytes being hashed, not the download's size.
+        if matches!(st.state, librqbit::TorrentStatsState::Live | librqbit::TorrentStatsState::Paused) {
             mgr.with_item(&id, |it| it.total_size = wanted_now);
         }
         let (note, peers, up_speed) = match (&st.state, &st.live) {
@@ -1079,6 +1313,10 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentH
         run.active.store(peers as i32, Ordering::Relaxed);
         let refresh = ticks % 4 == 1;
         mgr.with_item(&id, |it| {
+            it.status = if matches!(st.state, librqbit::TorrentStatsState::Initializing { .. }) {
+                it.verify_progress = if st.total_bytes > 0 { st.progress_bytes as f64 * 100.0 / st.total_bytes as f64 } else { 0.0 };
+                DlStatus::Verifying
+            } else { DlStatus::Downloading };
             if refresh {
                 swarm(&h, it);
             }
@@ -1087,6 +1325,9 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentH
             it.connected_peers = peers as i32;
         });
         if st.finished && matches!(st.state, librqbit::TorrentStatsState::Live | librqbit::TorrentStatsState::Paused) {
+            if it.torrent_mark_unfinished && meta.files.iter().enumerate().any(|(i, (p, _))| !skipped.contains(&(i as i32)) && librqbit::storage::filesystem::marked_path(&Path::new(&folder).join(p)).exists()) {
+                return Err(DlError::fatal("Couldn't finalize torrent filenames. Close programs using the files, resolve any filename conflict, then resume."));
+            }
             break;
         }
     }
@@ -1094,7 +1335,7 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentH
     let s = mgr.settings();
     let own_seed_limit = mgr.with_item(&id, |it| it.seeding_limit_kbps).unwrap_or(0);
     // Ratio 0, or a seeding limit of "No upload": it isn't shared once finished.
-    let seed = s.torrent_seed_ratio > 0.0 && own_seed_limit >= 0 && s.torrent_seeding_limit_kbps >= 0;
+    let seed = (s.torrent_seed_ratio > 0.0 || s.torrent_seed_action == "Remove") && own_seed_limit >= 0 && s.torrent_seeding_limit_kbps >= 0;
     if !seed {
         let _ = session.pause(&h).await;
     }
@@ -1108,6 +1349,16 @@ async fn go(mgr: &Arc<Manager>, run: &Arc<Run>, out: &mut Option<ManagedTorrentH
         }
     }
     let total = h.stats().total_bytes as i64;
+    if !it.incomplete_folder.is_empty() {
+        session.pause(&h).await.map_err(anyhow_err)?;
+        svc.move_data(mgr, &id, &it.save_folder).await?;
+        mgr.with_item(&id, |i| i.incomplete_folder.clear());
+        if seed {
+            let final_it = mgr.item(&id).ok_or_else(DlError::cancelled)?;
+            let final_h = svc.add(mgr, &session, std::fs::read(&cached)?, &meta, &output_folder(&final_it, &meta), &final_it, own, false).await?;
+            *out = Some(final_h);
+        }
+    }
     mgr.with_item(&id, |it| {
         if total > 0 {
             it.total_size = total;
@@ -1197,5 +1448,24 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&x).unwrap(), "first");
         assert_eq!(std::fs::read_to_string(&y).unwrap(), "second");
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[path = "torrent_regressions.rs"]
+mod regressions;
+
+pub fn blocklist_source(source: &str) -> Result<Option<String>, String> {
+    let source = source.trim();
+    if source.is_empty() { return Ok(None); }
+    if Path::new(source).is_absolute() {
+        return url::Url::from_file_path(source).map(|u| Some(u.to_string())).map_err(|_| "Invalid blocklist file path.".into());
+    }
+    let u = url::Url::parse(source).map_err(|_| "Use an HTTP(S) URL or an absolute blocklist file path.")?;
+    if !u.username().is_empty() || u.password().is_some() { return Err("Blocklist URLs cannot contain login details.".into()); }
+    match u.scheme() {
+        "http" | "https" if u.host_str().is_some() => Ok(Some(u.to_string())),
+        "file" if u.to_file_path().is_ok_and(|p| p.is_absolute()) => Ok(Some(u.to_string())),
+        _ => Err("Use an HTTP(S) URL or an absolute blocklist file path.".into()),
     }
 }

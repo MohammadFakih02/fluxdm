@@ -45,17 +45,25 @@ current Windows 10. If it's missing, the setup installs it.
   videos.
 - **Torrents:** magnet links, .torrent links and files, using librqbit.
   - TCP + µTP, DHT, UPnP and fast resume.
-  - Pick which files to download.
+  - Pick which files to download. Unticked files stay absent; shared boundary bytes are retained in a hidden part-file folder and restored if you select the files later.
   - Separate upload limits while downloading and while seeding (for all torrents, or per torrent in the Add window
-    and the right-click menu), with a real *No upload*, and a seed-ratio target.
+    and the right-click menu), with a real *No upload*, a seed-ratio target and an optional seeding time limit.
+  - When either seeding target is reached, stop sharing or remove the torrent while keeping its files.
+  - Global extra trackers, filename exclusions (initially unticked files) and optional per-file `.!fx` unfinished markers for new torrents.
   - *Stop sharing* / *Resume sharing* on a finished torrent (right-click).
   - Force recheck/reannounce, move data, add trackers, export .torrent, copy the magnet link.
   - **Download in order** (right-click): fetches each file from its first piece to its last, so a video can be watched while it downloads.
   - Set location on an unfinished torrent moving to another drive offers to start over there instead of copying the full-size placeholder files.
 - **Organising:** categories, tags, queues with a scheduler that can start and stop queues at set times on
-  chosen days. When a queue finishes, FluxDM can exit, sleep, hibernate, shut down or restart, with a
-  60-second countdown you can cancel.
-- **Speed:** a global limit, per-queue and per-download limits, and a daily speed schedule.
+  chosen days, catching up within the current window after a late start or sleep, including overnight windows.
+  Queues can stay enabled when empty and retry failures with their own count and delay. Add remembers the last queue.
+  Manual downloads run up to three at once by default, configurable in Settings > Downloads.
+  When a queue finishes, FluxDM can exit, sleep, hibernate, shut down or restart, with a
+  60-second countdown you can cancel. Finish actions are skipped while other downloads are active or waiting; failed batches report their failure count without running an action.
+- **Main window:** icon filters, resizable download cards, saved sorting and optional grouping by date, status, type, site or queue (ungrouped by default), and details on the right. The list’s More menu keeps bulk actions, Columns and an optional table view. The footer shows free space and download/upload limits; its upload picker sets both torrent phases, with separate limits in Settings and each torrent?s Options tab.
+- **Artwork:** Keyless Steam, Microsoft Store, PlayStation and GOG banners, with smaller Steam and web images as fallbacks. Programs and ISO images also try vendor, GitHub, referrer/host, Wikipedia, Snapcraft and Flathub artwork. Screenshots are subdued, and publisher/distro colours tint icon washes. Wide images retain their proportions when the window grows.
+- **Storage and proxy:** optional unfinished folders for new HTTP/torrent downloads, regular-file collision choices, and None/System/HTTP/SOCKS5 proxies. SOCKS5 torrent TCP peers disable uTP; DHT/UDP remain direct.
+- **Speed:** a global limit, per-queue and per-download limits, and a speed schedule with selected weekdays and overnight windows.
   Global and queue budgets share spare bandwidth fairly across download types;
   videos reconnect for changes over 30%, at most once a minute.
 - **Catching downloads:**
@@ -120,3 +128,5 @@ to turn on the check.
 ([LICENSE-APACHE](src-tauri/vendor/LICENSE-APACHE)); see `src-tauri/vendor/PATCHES.md` for what was changed and
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for everything else FluxDM uses.
 
+
+Torrent settings include an optional watched .torrent folder, a weekly refreshed HTTP(S)/local PeerGuardian IP blocklist, and DHT, local discovery and IPv4-only controls. Networking defaults are unchanged; discovery/IP/blocklist changes require restart. See GUIDE.md for import and refresh behavior.

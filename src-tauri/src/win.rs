@@ -239,8 +239,22 @@ pub fn starts_with_windows() -> bool {
     let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
     hkcu.open_subkey(RUN_KEY)
         .and_then(|k| k.get_value::<String, _>("FluxDM"))
-        .map(|cmd| cmd.to_lowercase().contains(&exe().to_lowercase()))
+        .map(|cmd| run_entry_is_this_exe(&cmd, &exe()))
         .unwrap_or(false)
+}
+
+/// The same file, however it is spelled: an update can start FluxDM through a short (8.3) or differently
+/// cased path, and a text comparison then wrongly reported "off" and the setting was lost.
+fn run_entry_is_this_exe(cmd: &str, exe: &str) -> bool {
+    let target = cmd.trim().strip_prefix('"').and_then(|r| r.split('"').next()).unwrap_or_else(|| cmd.split(" --").next().unwrap_or(cmd)).trim();
+    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    if same(target, exe) {
+        return true;
+    }
+    match (std::fs::canonicalize(target), std::fs::canonicalize(exe)) {
+        (Ok(a), Ok(b)) => same(&a.to_string_lossy(), &b.to_string_lossy()),
+        _ => false,
+    }
 }
 
 pub fn set_start_with_windows(on: bool) {
@@ -533,4 +547,14 @@ unsafe fn hbitmap_png(hbmp: windows::Win32::Graphics::Gdi::HBITMAP) -> Option<Ve
         wr.write_image_data(&px).ok()?;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod startup_tests {
+    #[test]
+    fn run_entry_matches_quoted_and_case_insensitive_paths() {
+        assert!(super::run_entry_is_this_exe(r#""C:\Apps\FluxDM\FluxDM.exe" --tray"#, r"c:\apps\fluxdm\fluxdm.exe"));
+        assert!(!super::run_entry_is_this_exe(r#""C:\Other\FluxDM.exe" --tray"#, r"C:\Apps\FluxDM\FluxDM.exe"));
+        assert!(super::run_entry_is_this_exe(r"C:\Apps\FluxDM.exe --tray", r"C:\Apps\FluxDM.exe"));
+    }
 }

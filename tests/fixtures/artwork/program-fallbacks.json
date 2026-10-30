@@ -1,0 +1,58 @@
+{
+  "wiki": {
+    "originalimage": {
+      "source": "https://example.invalid/vlc.jpg",
+      "width": 1920,
+      "height": 1080
+    }
+  },
+  "logo": {
+    "originalimage": {
+      "source": "https://example.invalid/logo.png",
+      "width": 512,
+      "height": 180
+    }
+  },
+  "snap": {
+    "snap": {
+      "media": [
+        {
+          "type": "icon",
+          "url": "icon"
+        },
+        {
+          "type": "banner",
+          "url": "https://example.invalid/banner.png"
+        },
+        {
+          "type": "screenshot",
+          "url": "https://example.invalid/screen.png"
+        }
+      ]
+    }
+  },
+  "flat": {
+    "branding": [
+      {
+        "scheme": "light",
+        "color": "#123456"
+      }
+    ],
+    "screenshots": [
+      {
+        "sizes": [
+          {
+            "width": 624,
+            "height": 351,
+            "url": "small"
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "url": "https://example.invalid/screen.png"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -155,7 +155,7 @@ impl TorrentMetadata {
             .iter_file_details_ext()
             .map(|fd| {
                 Ok::<_, anyhow::Error>(FileInfo {
-                    relative_filename: fd.details.filename.to_pathbuf(),
+                    relative_filename: crate::safe_path::path(fd.details.filename.iter_components()),
                     offset_in_torrent: fd.offset,
                     piece_range: fd.pieces,
                     len: fd.details.len,
@@ -163,7 +163,12 @@ impl TorrentMetadata {
                 })
             })
             .collect::<anyhow::Result<Vec<FileInfo>>>()?;
-
+        let mut file_infos = file_infos;
+        let mut names: Vec<std::path::PathBuf> = file_infos.iter().map(|f| f.relative_filename.clone()).collect();
+        crate::safe_path::unique(&mut names);
+        for (f, name) in file_infos.iter_mut().zip(names) {
+            f.relative_filename = name;
+        }
         Ok(Self {
             info,
             torrent_bytes,
@@ -216,6 +221,14 @@ pub struct ManagedTorrent {
 }
 
 impl ManagedTorrent {
+    /// FluxDM patch: ask discovery tasks again without pausing or checking data.
+    pub fn force_announce(&self) -> anyhow::Result<()> {
+        let g = self.locked.read();
+        if g.paused || !matches!(g.state, ManagedTorrentState::Live(_)) { bail!("Start it first"); }
+        self.shared.session.upgrade().context("session is dead")?.force_announce(self.info_hash());
+        Ok(())
+    }
+
     pub fn id(&self) -> TorrentId {
         self.shared.id
     }
@@ -333,6 +346,15 @@ impl ManagedTorrent {
         self.live()
     }
 
+    pub fn storage_full(&self) -> bool {
+        let locked = self.locked.read();
+        match &locked.state {
+            ManagedTorrentState::Error(e) => e.chain().filter_map(|e| e.downcast_ref::<std::io::Error>())
+                .any(|e| matches!(e.raw_os_error(), Some(39) | Some(112)) || e.kind() == std::io::ErrorKind::StorageFull),
+            _ => false,
+        }
+    }
+
     fn stop_with_error(&self, error: anyhow::Error) {
         let mut g = self.locked.write();
 
@@ -407,17 +429,20 @@ impl ManagedTorrent {
                         async move {
                             let concurrent_init_semaphore =
                                 session.concurrent_initialize_semaphore.clone();
-                            let _permit = concurrent_init_semaphore
-                                .acquire()
-                                .await
-                                .context("bug: concurrent init semaphore was closed")?;
-
-                            let check_result = init.check().await;
-                            init.finish_check();
+                            // FluxDM patch: a pause also interrupts the initialization queue.
+                            let check_result = async {
+                                let _permit = tokio::select! {
+                                    _ = init.pause_notify.notified() => anyhow::bail!("initial check paused"),
+                                    permit = concurrent_init_semaphore.acquire() => permit.context("bug: concurrent init semaphore was closed")?,
+                                };
+                                init.check().await
+                            }.await;
 
                             match check_result {
                                 Ok(paused) => {
                                     let mut g = t.locked.write();
+                                    // FluxDM patch: publish check completion under the state lock.
+                                    init.finish_check();
                                     if let ManagedTorrentState::Initializing(_) = &g.state {
                                     } else {
                                         debug!(
@@ -428,9 +453,13 @@ impl ManagedTorrent {
 
                                     g.state = ManagedTorrentState::Paused(paused);
                                     t.state_change_notify.notify_waiters();
-                                    _start(&t, peer_rx, start_paused, session, Some(g), token)
+                                    // FluxDM patch: honor a pause received while checking.
+                                    let stay_paused = g.paused;
+                                    _start(&t, peer_rx, stay_paused, session, Some(g), token)
                                 }
                                 Err(err) => {
+                                    let mut g = t.locked.write();
+                                    init.finish_check();
                                     if init.is_pause_requested() {
                                         debug!("initial check paused");
                                         t.state_change_notify.notify_waiters();
@@ -438,7 +467,7 @@ impl ManagedTorrent {
                                     }
 
                                     let result = anyhow::anyhow!("{:?}", err);
-                                    t.locked.write().state = ManagedTorrentState::Error(err);
+                                    g.state = ManagedTorrentState::Error(err);
                                     t.state_change_notify.notify_waiters();
                                     Err(result)
                                 }
@@ -474,7 +503,7 @@ impl ManagedTorrent {
                         g.only_files.clone(),
                         t.shared
                             .storage_factory
-                            .create_and_init(t.shared(), &metadata)?,
+                            .create_and_init_selected(t.shared(), &metadata, g.only_files.as_deref())?,
                         true,
                     ));
                     g.state = ManagedTorrentState::Initializing(initializing.clone());
@@ -513,7 +542,7 @@ impl ManagedTorrent {
     /// Pause the torrent if it's live.
     pub(crate) fn pause(&self) -> anyhow::Result<()> {
         let mut g = self.locked.write();
-        match &g.state {
+        match &mut g.state {
             ManagedTorrentState::Live(live) => {
                 let paused = live.pause()?;
                 g.state = ManagedTorrentState::Paused(paused);
@@ -528,8 +557,11 @@ impl ManagedTorrent {
                 self.state_change_notify.notify_waiters();
                 Ok(())
             }
-            ManagedTorrentState::Paused(_) => {
-                bail!("torrent is already paused");
+            ManagedTorrentState::Paused(p) => {
+                // FluxDM patch: pause is idempotent and durably saves even already-paused data.
+                p.chunk_tracker.get_have_pieces_mut().flush(false)?;
+                g.paused = true;
+                Ok(())
             }
             ManagedTorrentState::Error(_) => {
                 bail!("can't pause torrent in error state")
@@ -561,6 +593,7 @@ impl ManagedTorrent {
             let g = self.locked.read();
             match &g.state {
                 ManagedTorrentState::Initializing(i) => {
+                    resp.total_bytes = i.checking_total_bytes();
                     resp.state = S::Initializing { paused: g.paused };
                     resp.progress_bytes = i.checked_bytes.load(Ordering::Relaxed);
                 }

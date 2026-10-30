@@ -68,6 +68,13 @@ pub struct WriteThroughCacheStorage<U> {
 }
 
 impl<U: TorrentStorage> TorrentStorage for WriteThroughCacheStorage<U> {
+    // FluxDM patch: retain filesystem routing through storage wrappers.
+    fn set_file_selection(&self, only_files: Option<&[usize]>) -> anyhow::Result<()> {
+        self.underlying.set_file_selection(only_files)
+    }
+    fn remove_partfile(&self) -> anyhow::Result<()> {
+        self.underlying.remove_partfile()
+    }
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         let file = self.file_infos.get(file_id).context("wrong file")?;
         let current = self

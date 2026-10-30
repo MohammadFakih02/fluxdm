@@ -47,7 +47,7 @@ body { background: var(--panel); }
 .grid input:disabled, .grid select:disabled { opacity: .5; }
 .grid label.check { padding: 0; align-items: center; }
 .grid label.check input { margin: 0; }
-#add.torrent [data-notorrent], #add.torrent #advanced, #add.torrent #videoBlock { display: none; }
+#add.torrent [data-notorrent], #add.torrent #videoBlock { display: none; }
 #add:not(.torrent) [data-torrentonly] { display: none; }
 #advanced summary { cursor: default; color: var(--text-2); padding: 4px 0; }
 #advanced summary:hover { color: var(--text); }
@@ -67,3 +67,54 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--panel-2); 
   .speed-queue > label { text-align: left; margin-top: 6px; }
   #videoPanel { flex-wrap: wrap; }
 }
+/* Add form surfaces follow the desktop glass and artwork preferences. */
+body { background: var(--bg); }
+#windowArt { position:fixed; inset:-60px; background:center/cover; filter:blur(var(--art-user-blur, max(var(--art-blur),var(--art-adaptive-blur,48px)))) saturate(.65) brightness(calc(var(--art-brightness,.035) * var(--art-strength,1))); opacity:var(--art-opacity); pointer-events:none; }
+#add { position:relative; }
+#add header { display:flex; align-items:center; gap:10px; padding:14px 18px; background:rgba(8,10,15,.55); border-bottom:1px solid var(--line); }
+#add header b { font-size:15px; } #addGlyph { display:flex; color:var(--accent); } #addGlyph svg { width:18px; height:18px; }
+#headerNote { margin-left:auto; color:var(--text-3); font-size:12px; text-align:right; }
+#add .scroll { padding:16px 18px; gap:14px; }
+.linkbar { gap:6px; } #urls { height:40px; min-height:40px; line-height:38px; border-radius:10px; border-color:var(--accent); font-size:12px; }
+.link-input { position:relative; display:flex; flex:1; min-width:0; }
+/* Solid backing so a long link scrolled sideways passes under the icon instead of through it. */
+#linkGlyph { position:absolute; left:1px; top:1px; bottom:1px; width:34px; z-index:1; display:grid; place-items:center; border-radius:9px 0 0 9px; background:var(--input); box-shadow:6px 0 6px -2px var(--input); color:var(--text-3); pointer-events:none; }
+#add.expanded #linkGlyph { bottom:auto; height:38px; }
+#linkGlyph svg { width:16px; height:16px; }
+#urls { padding-left:38px; }
+#openTorrent,.iconbtn { height:40px; } #openTorrent { margin:0; }
+#detected { position:relative; display:flex; align-items:center; gap:14px; padding:16px; min-height:128px; border-radius:12px; overflow:hidden; border:1px solid rgba(255,255,255,.12); background:#182333; }
+#detectedArt,#typeWatermark { position:absolute; inset:0; background:center/cover; }
+#detectedArt { filter:brightness(var(--art-card-brightness,.65)) saturate(.65); }
+#detected:after { content:""; position:absolute; inset:0; background:linear-gradient(90deg,rgba(8,10,15,.92),rgba(8,10,15,.55) 55%,rgba(8,10,15,.2)); }
+#typeWatermark { display:flex; justify-content:flex-end; align-items:center; color:var(--upload); opacity:.22; } #typeWatermark svg { width:220px; height:220px; transform:rotate(-5deg); }
+#detected.type-torrent { background:radial-gradient(circle at 90% 20%,#12304d 0 27%,#0c1a2c 28%); }
+#detected.type-video { background:#3b1d2a; } #detected.type-ai { background:#302046; } #detected.type-program { background:#163c39; } #detected.type-archive { background:#392b19; }
+#detectedIcon { position:relative; z-index:1; width:72px; height:72px; border-radius:15px; overflow:hidden; border:2px solid rgba(255,255,255,.22); background:#1b2a3f; color:var(--upload); display:grid; place-items:center; flex:none; box-shadow:0 6px 18px rgba(0,0,0,.5); }
+#detectedIcon svg { width:32px; height:32px; } #detectedIcon img { width:100%; height:100%; object-fit:cover; }
+.detected-copy { position:relative; z-index:1; min-width:0; } #chips { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:6px; } #chips span { padding:2px 8px; border-radius:6px; background:rgba(8,10,15,.7); font-size:11px; font-weight:600; }
+#detectedTitle { margin:0; font-size:22px; font-weight:800; line-height:1.15; overflow-wrap:anywhere; } #detectedSize { color:var(--text-2); font-size:12px; margin-top:3px; overflow-wrap:anywhere; }
+#info { background:transparent; padding:0; font-size:12px; color:var(--text-3); } #info:empty { display:none; }
+.grid { gap:10px 12px; color:var(--text-2); } .grid input[type=text],.grid select,#browse { min-height:36px; } .grid .mono { font-size:12px; }
+#freeSpace { margin-top:-6px; color:var(--ok); font-size:12px; } #freeSpace.warn { color:var(--err); }
+#conn { width:64px; min-height:36px; } .queue-row { flex-wrap:wrap; } #queue { max-width:220px; }
+#advanced summary { display:inline-block; padding:8px 12px; background:rgba(8,10,15,.6); border-radius:8px; font-size:12px; cursor:pointer; } #advanced summary:before { content:'\203a'; margin-right:10px; } #advanced[open] summary:before { content:'\2304'; }
+#add footer { padding:14px 18px; background:rgba(8,10,15,.7); align-items:center; flex-wrap:wrap; } #add footer .check { margin-right:auto; font-size:12px; } #add footer button { min-width:0; height:38px; } #add footer #start { min-width:156px; box-shadow:0 0 16px color-mix(in srgb,var(--accent) 18%,transparent); font-weight:700; }
+#add.torrent .scroll > #torrentPanel { min-height:170px; flex:1 0 170px; border:1px solid var(--line); border-radius:12px; overflow:hidden; background:rgba(8,10,15,.62); }
+.thead-row { padding:8px 10px; border-bottom:1px solid var(--line); margin:0; flex-wrap:wrap; } #tFilter { flex:1; width:120px; height:30px; } #torrentSel { order:4; font-size:12px; font-weight:400; color:var(--text-3); flex:none; } #tree { border:0; border-radius:0; background:transparent; } .trow { min-height:30px; } .trow .tsize { font-family:var(--mono); }
+@media(max-width:599px) { #add header { flex-wrap:wrap; } #headerNote { font-size:11px; } #detectedTitle { font-size:19px; } #detectedIcon { width:56px; height:56px; } #openTorrent { font-size:11px; padding:0 7px; } #add footer .check { width:100%; } .grid > #freeSpace { margin-top:-4px; } }
+.tpriority { min-height:22px; height:22px; width:82px; padding:0 4px; font-size:11px; }
+#videoBlock { padding:10px 0; } #videoPanel { flex-wrap:wrap; }
+#urls { font-weight:400; } .grid > span,.grid > label { font-weight:400; }
+#detectedSize,#freeSpace,.trow .tsize { font-weight:400; }
+
+#detectedArt.icon-wash { transform:scale(1.2); filter:blur(24px) saturate(.65) brightness(var(--art-card-brightness,.5)); }
+
+#detected { container-type:inline-size; }
+#detected:has(#detectedArt.aspect-banner) { min-height:clamp(128px,calc(100vw / var(--banner-ratio,3.1)),240px); }
+
+/* The header is the window's title bar; the window buttons sit at its right edge. */
+#add header[data-tauri-decorum-tb] { padding-right:0; -webkit-user-select:none; user-select:none; }
+#add header #headerNote { margin-left:auto; padding-right:8px; }
+#add header .decorum-tb-btn { align-self:stretch; height:auto !important; min-height:40px; }
+@media(max-width:599px) { #add header[data-tauri-decorum-tb] { flex-wrap:nowrap; } #add header #headerNote { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } }

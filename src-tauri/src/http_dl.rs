@@ -4,7 +4,7 @@
 //! of the largest remaining segment, so all connections stay busy until the very end.
 //!
 //! Backup links (mirrors): connections are spread round-robin over every link that still works. A link that
-//! fails permanently (404/403/410, wrong size, no range support…) is dropped and the others carry on; the
+//! fails permanently (404/403/410) is dropped and the others carry on; content changes pause safely. The
 //! download only fails when every link is dead. Mirrors added while running are picked up live.
 
 use crate::manager::{Manager, Run};
@@ -97,8 +97,7 @@ pub async fn run(mgr: Arc<Manager>, run: Arc<Run>) {
         Err(e) => {
             mgr.with_item(&id, |it| {
                 it.downloaded = done;
-                it.error_message = e.msg.clone();
-                it.set_status(DlStatus::Error);
+                e.apply_download_error(it);
             });
         }
     }
@@ -142,6 +141,15 @@ impl Ctx {
             return None;
         }
         Some(segs.iter().map(|s| s.lock().downloaded).sum())
+    }
+
+    fn has_progress(&self) -> bool {
+        self.run.current.load(Ordering::Relaxed) > 0 || self.segmented_done().unwrap_or(0) > 0
+            || self.mgr.with_item(&self.id, |it| it.downloaded > 0).unwrap_or(false)
+    }
+
+    fn check_response(&self, resp: &reqwest::Response) -> DlResult<()> {
+        net::ensure_file(resp, &self.mgr.with_item(&self.id, |it| it.file_name.clone()).unwrap_or_default())
     }
 
     fn part_path(&self) -> String {
@@ -238,8 +246,7 @@ impl Ctx {
         }
         let sample = self.sample(link).await?;
         if Some(&sample) != reference.as_ref() {
-            self.mark_dead(link, &DlError::fatal("it serves different content (same size, different bytes)"));
-            return Ok(false);
+            return Err(DlError { msg: "The file on the server changed.".into(), fatal: true, status: 0, kind: ErrKind::Changed });
         }
         self.links.lock().verified[link] = true;
         Ok(true)
@@ -255,8 +262,12 @@ impl Ctx {
             let fut = async {
                 let resp = net::build(&self.url_at(link), &self.headers, &self.ua, Some((start, Some(end))), Method::GET).send().await?;
                 net::ensure_ok(&resp)?;
+                self.check_response(&resp)?;
                 if resp.status() != StatusCode::PARTIAL_CONTENT {
-                    return Err(DlError::fatal("The server doesn't support resuming (byte ranges)"));
+                    return Err(DlError { msg: "The server stopped allowing resume.".into(), fatal: true, status: 0, kind: ErrKind::NoResume });
+                }
+                if net::content_range(&resp).and_then(|(_, _, size)| size).is_some_and(|size| size != total) {
+                    return Err(DlError { msg: "The file on the server changed.".into(), fatal: true, status: 0, kind: ErrKind::Changed });
                 }
                 Ok::<_, DlError>(resp.bytes().await?.to_vec())
             };
@@ -280,41 +291,33 @@ impl Ctx {
         if self.mgr.with_item(&self.id, |it| it.verification_pending && std::path::Path::new(&it.part_path()).is_file()).unwrap_or(false) {
             return self.finish().await;
         }
-        for restart in 0..=3 {
-            let probe = self.retry(|| self.probe_any()).await?;
-            let probe = self.confirm_probe(probe).await?;
-            self.apply_probe(&probe);
-            let folder = self.mgr.with_item(&self.id, |it| it.save_folder.clone()).unwrap_or_default();
-            std::fs::create_dir_all(&folder)?;
-            self.check_disk_space(&folder)?;
-            self.mgr.with_item(&self.id, |it| {
-                it.set_status(DlStatus::Downloading);
-                it.error_message.clear();
-            });
+        let probe = self.retry(|| self.probe_any()).await?;
+        let probe = self.confirm_probe(probe).await?;
+        self.apply_probe(&probe)?;
+        let it = self.mgr.item(&self.id).ok_or_else(DlError::cancelled)?;
+        self.check_existing(&it)?;
+        let folder = it.storage_folder().to_string();
+        std::fs::create_dir_all(&folder)?;
+        self.check_disk_space(&folder)?;
+        self.mgr.with_item(&self.id, |it| {
+            it.set_status(DlStatus::Downloading);
+            it.error_message.clear();
+        });
 
-            let result = if probe.resumable && probe.total > 0 {
-                self.clone().segmented().await
-            } else {
-                self.single(probe.total).await
-            };
-            match result {
-                Err(e) if e.kind == ErrKind::Changed => {
-                    // All workers have stopped before discarding any bytes or validators.
-                    self.segs.lock().clear();
-                    std::fs::remove_file(self.part_path())?;
-                    self.run.current.store(0, Ordering::Relaxed);
-                    *self.fatal.lock() = None;
-                    *self.reference.lock().await = None;
-                    self.links.lock().verified.fill(false);
-                    self.mgr.with_item(&self.id, |it| { it.downloaded = 0; it.http_validator = None; it.http_validator_url = None; });
-                    if restart == 3 { return Err(DlError::fatal("The file on the server keeps changing. Try again later.")); }
-                    self.item_msg("The file on the server changed; starting again from zero.");
-                }
-                Err(e) => return Err(e),
-                Ok(()) => return self.finish().await,
+        let result = if probe.resumable && probe.total > 0 {
+            self.clone().segmented().await
+        } else {
+            self.single(probe.total).await
+        };
+        match result {
+            Err(e) if e.kind == ErrKind::NoResume && !self.has_progress() => {
+                self.segs.lock().clear();
+                self.single(probe.total).await?;
+                self.finish().await
             }
+            Err(e) => Err(e),
+            Ok(()) => self.finish().await,
         }
-        unreachable!()
     }
 
     async fn retry<T, F, Fut>(&self, op: F) -> DlResult<T>
@@ -341,7 +344,7 @@ impl Ctx {
         let timeout = self.mgr.settings().read_timeout_sec;
         let mut last = None;
         while let Some(i) = self.first_alive() {
-            match net::probe(&self.url_at(i), &self.headers, &self.ua, timeout).await {
+            match net::probe_file(&self.url_at(i), &self.headers, &self.ua, timeout, &self.mgr.with_item(&self.id, |it| it.file_name.clone()).unwrap_or_default()).await {
                 Ok(p) => {
                     self.probed_link.store(i, Ordering::Relaxed);
                     return Ok(p);
@@ -359,7 +362,7 @@ impl Ctx {
                     }
                     // Transient failure: try the next link before backing off.
                     if let Some(j) = self.next_alive_after(i).filter(|j| *j != i) {
-                        match net::probe(&self.url_at(j), &self.headers, &self.ua, timeout).await {
+                        match net::probe_file(&self.url_at(j), &self.headers, &self.ua, timeout, &self.mgr.with_item(&self.id, |it| it.file_name.clone()).unwrap_or_default()).await {
                             Ok(p) => {
                                 self.probed_link.store(j, Ordering::Relaxed);
                                 return Ok(p);
@@ -377,11 +380,9 @@ impl Ctx {
         Err(last.unwrap_or_else(|| DlError::fatal("Every link for this file has failed")))
     }
 
-    /// A single probe is never enough reason to throw away real progress: a rate limiter's error page, an
-    /// edge-cache miss or a load balancer hiccup looks exactly like "the file changed". Only a consistent
-    /// mismatch is trusted.
+    /// Confirm size/range mismatches before asking the user to refresh a link; progress is never discarded.
     async fn confirm_probe(&self, mut probe: net::Probe) -> DlResult<net::Probe> {
-        let has_progress = !self.segs.lock().is_empty() && std::path::Path::new(&self.part_path()).exists();
+        let has_progress = self.has_progress();
         let known = self.total.load(Ordering::Relaxed);
         if !has_progress || (probe.resumable && probe.total == known) {
             return Ok(probe);
@@ -403,14 +404,20 @@ impl Ctx {
     }
 
     /// Reconciles saved progress with what the server says now.
-    fn apply_probe(&self, p: &net::Probe) {
-        let Some(it) = self.mgr.item(&self.id) else { return };
-        let mut has_progress = !self.segs.lock().is_empty() && std::path::Path::new(&it.part_path()).exists();
-        if has_progress && (!p.resumable || p.total != it.total_size || net::validator_changed(self.validator_for(&p.url).as_deref(), p.validator.as_deref())) {
-            // The file on the server changed (or lost range support): the bytes we have are useless.
+    fn apply_probe(&self, p: &net::Probe) -> DlResult<()> {
+        let Some(it) = self.mgr.item(&self.id) else { return Ok(()) };
+        let has_progress = self.has_progress();
+        if has_progress {
+            let msg = if p.total != it.total_size {
+                Some(format!("The file on the server changed size ({} -> {}). Refresh the link, or restart from zero.", fmt::size(it.total_size), fmt::size(p.total)))
+            } else if net::validator_changed(self.validator_for(&p.url).as_deref(), p.validator.as_deref()) {
+                Some("The file on the server changed.".into())
+            } else if !p.resumable {
+                Some("The server stopped allowing resume.".into())
+            } else { None };
+            if let Some(msg) = msg { return Err(DlError { msg, fatal: true, status: 0, kind: ErrKind::Changed }); }
+        } else {
             self.segs.lock().clear();
-            let _ = std::fs::remove_file(it.part_path());
-            has_progress = false;
         }
         let new_name = (it.auto_name && !has_progress)
             .then(|| p.file_name.clone())
@@ -441,6 +448,7 @@ impl Ctx {
         if !has_progress {
             self.run.current.store(0, Ordering::Relaxed);
         }
+        Ok(())
     }
 
     fn check_disk_space(&self, folder: &str) -> DlResult<()> {
@@ -600,7 +608,7 @@ impl Ctx {
                     break;
                 }
                 Err(e) if e.kind == ErrKind::Cancelled || self.run.is_cancelled() => break,
-                Err(e) if e.kind == ErrKind::Changed => {
+                Err(e) if matches!(e.kind, ErrKind::Changed | ErrKind::NoResume) => {
                     self.set_fatal(e);
                     break;
                 }
@@ -666,24 +674,31 @@ impl Ctx {
         };
         let total = self.total.load(Ordering::Relaxed);
         let url = self.url_at(link);
-        let req = net::build(&url, &self.headers, &self.ua, Some((from, Some(to))), Method::GET);
         let validator = self.validator_for(&url);
-        let req = net::if_range(req, validator.as_deref());
-        let mut resp = match c(&self.run, tokio::time::timeout(self.stall, req.send())).await? {
-            Ok(r) => r?,
-            Err(_) => return Err(DlError::timeout(format!("No data for {}s", self.stall.as_secs()))),
+        let mut range_attempt = 0;
+        let mut resp = loop {
+            let req = net::if_range(net::build(&url, &self.headers, &self.ua, Some((from, Some(to))), Method::GET), validator.as_deref());
+            let resp = match c(&self.run, tokio::time::timeout(self.stall, req.send())).await? {
+                Ok(r) => r?,
+                Err(_) => return Err(DlError::timeout(format!("No data for {}s", self.stall.as_secs()))),
+            };
+            net::ensure_ok(&resp)?;
+            self.check_response(&resp)?;
+            if net::range_changed(validator.as_deref(), StatusCode::PARTIAL_CONTENT, resp.headers()) {
+                return Err(DlError { msg: "The file on the server changed.".into(), fatal: true, status: 0, kind: ErrKind::Changed });
+            }
+            if resp.status() == StatusCode::PARTIAL_CONTENT { break resp; }
+            if range_attempt == 2 {
+                return Err(DlError { msg: "The server stopped allowing resume.".into(), fatal: true, status: 0, kind: ErrKind::NoResume });
+            }
+            drop(resp);
+            c(&self.run, tokio::time::sleep(backoff(range_attempt))).await?;
+            range_attempt += 1;
         };
-        net::ensure_ok(&resp)?;
-        if net::range_changed(validator.as_deref(), resp.status(), resp.headers()) {
-            return Err(DlError { msg: "The file on the server changed".into(), fatal: true, status: 0, kind: ErrKind::Changed });
-        }
-        if resp.status() != StatusCode::PARTIAL_CONTENT {
-            return Err(DlError::fatal("The server doesn't support resuming (byte ranges)"));
-        }
         let cr = net::content_range(&resp);
         if let Some((_, _, Some(len))) = cr {
             if len != total {
-                return Err(DlError::fatal(format!("This link serves a different file ({} instead of {})", fmt::size(len), fmt::size(total))));
+                return Err(DlError { msg: format!("The file on the server changed size ({} -> {}). Refresh the link, or restart from zero.", fmt::size(total), fmt::size(len)), fatal: true, status: 0, kind: ErrKind::Changed });
             }
         }
         if cr.map(|c| c.0) != Some(from) {
@@ -751,14 +766,14 @@ impl Ctx {
 
     // ------------------------------------------------------------------ single connection
 
-    /// For servers without range support (or unknown size): one stream, restarted on failure.
+    /// For servers without range support (or unknown size): never overwrite bytes after a failure.
     async fn single(&self, total: i64) -> DlResult<()> {
+        if self.has_progress() { return Err(DlError { msg: "The server stopped allowing resume.".into(), fatal: true, status: 0, kind: ErrKind::NoResume }); }
         self.segs.lock().clear();
         let part = self.part_path();
         let queue = self.queue();
         let mut attempt = 1;
         loop {
-            self.run.current.store(0, Ordering::Relaxed);
             let Some(link) = self.pick_url() else { return Err(DlError::fatal("Every link for this file has failed")) };
             let r: DlResult<()> = async {
                 let req = net::build(&self.url_at(link), &self.headers, &self.ua, None, Method::GET);
@@ -767,8 +782,15 @@ impl Ctx {
                     Err(_) => return Err(DlError::timeout(format!("No data for {}s", self.stall.as_secs()))),
                 };
                 net::ensure_ok(&resp)?;
+                self.check_response(&resp)?;
+                if self.has_progress() { return Err(DlError { msg: "The server stopped allowing resume.".into(), fatal: true, status: 0, kind: ErrKind::NoResume }); }
                 use std::io::Write;
                 let mut f = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&part)?);
+                // A single stream is a contiguous prefix; retain its map if ranges return on a later run.
+                if total > 0 {
+                    *self.segs.lock() = vec![Arc::new(Mutex::new(Segment { start: 0, end: total - 1, downloaded: 0, active: false }))];
+                }
+                self.mgr.with_item(&self.id, |it| it.resumable = false);
                 self.run.active.store(1, Ordering::Relaxed);
                 loop {
                     let chunk = match c(&self.run, tokio::time::timeout(self.stall, resp.chunk())).await? {
@@ -778,6 +800,7 @@ impl Ctx {
                     let Some(data) = chunk else { break };
                     f.write_all(&data)?;
                     self.run.current.fetch_add(data.len() as i64, Ordering::Relaxed);
+                    if let Some(seg) = self.segs.lock().first() { seg.lock().downloaded += data.len() as i64; }
                     self.run.bytes.fetch_add(data.len() as i64, Ordering::Relaxed);
                     self.mgr.throttle(&self.run, &queue, data.len()).await;
                 }
@@ -798,6 +821,8 @@ impl Ctx {
                 Ok(()) => return Ok(()),
                 Err(e) if e.kind == ErrKind::Cancelled || self.run.is_cancelled() => return Err(DlError::cancelled()),
                 Err(e) if local_fault(&e) => return Err(e),
+                Err(e) if matches!(e.kind, ErrKind::Changed | ErrKind::NoResume) => return Err(e),
+                Err(_) if self.has_progress() => return Err(DlError { msg: "The server stopped allowing resume.".into(), fatal: true, status: 0, kind: ErrKind::NoResume }),
                 Err(e) => {
                     if e.fatal && self.url_count() > 1 {
                         if !self.mark_dead(link, &e) {
@@ -818,10 +843,18 @@ impl Ctx {
 
     // ------------------------------------------------------------------ completion
 
+    fn check_existing(&self, it: &Item) -> DlResult<()> {
+        if std::path::Path::new(&it.full_path()).exists() && matches!(it.existing_file_policy.as_str(), "Ask" | "Skip") {
+            return Err(DlError { msg: if it.existing_file_policy == "Skip" { "Skipped: the destination file already exists." } else { "The destination file already exists. Choose an action from the file conflict dialog." }.into(), fatal: true, status: 0, kind: ErrKind::Conflict });
+        }
+        Ok(())
+    }
+
     async fn finish(&self) -> DlResult<()> {
         if self.run.is_cancelled() { return Err(DlError::cancelled()); }
         let done = self.run.current.load(Ordering::Relaxed);
         let Some(it) = self.mgr.item(&self.id) else { return Ok(()) };
+        self.check_existing(&it)?;
         let final_name = self.mgr.unique_name(&it.save_folder, &it.file_name, Some(&it.id), &[]);
         let final_path = std::path::Path::new(&it.save_folder).join(&final_name).to_string_lossy().into_owned();
         let expected = it.expected_hash.trim().to_lowercase();
@@ -854,7 +887,10 @@ impl Ctx {
         if self.run.is_cancelled() { return Err(DlError::cancelled()); }
         self.mgr.with_item(&self.id, |it| {
             if self.run.is_cancelled() { return Err(DlError::cancelled()); }
-            std::fs::rename(it.part_path(), &final_path)?;
+            std::fs::create_dir_all(&it.save_folder)?;
+            crate::torrent::publish_file(std::path::Path::new(&it.part_path()), std::path::Path::new(&final_path), it.existing_file_policy == "Overwrite")?;
+            let old_folder = std::mem::take(&mut it.incomplete_folder);
+            if !old_folder.is_empty() { let _ = std::fs::remove_dir(old_folder); }
             it.file_name = final_name;
             if it.total_size <= 0 { it.total_size = done; }
             it.downloaded = it.total_size;
@@ -881,6 +917,245 @@ mod tests {
         let mgr = Manager::new();
         mgr.st.lock().items.push(it.clone());
         (mgr, it, root)
+    }
+
+    #[tokio::test]
+    async fn unfinished_http_completion_preserves_collisions_and_moves_verified_data() {
+        for policy in ["Ask", "Skip", "Number", "Overwrite"] {
+            let (mgr, mut it, root) = fixture();
+            let stage = root.join("unfinished"); std::fs::create_dir_all(&stage).unwrap();
+            let old = it.part_path(); it.incomplete_folder = stage.to_string_lossy().into_owned(); it.existing_file_policy = policy.into();
+            std::fs::rename(old, it.part_path()).unwrap(); std::fs::write(it.full_path(), b"original").unwrap();
+            mgr.st.lock().items = vec![it.clone()];
+            let run = Run::test_run(&it.id); run.current.store(it.total_size, Ordering::Relaxed);
+            let ctx = Ctx::new(mgr.clone(), run, &it);
+            let result = ctx.finish().await;
+            if matches!(policy, "Ask" | "Skip") {
+                assert_eq!(result.unwrap_err().kind, ErrKind::Conflict);
+                assert!(std::path::Path::new(&it.part_path()).exists()); assert_eq!(std::fs::read(it.full_path()).unwrap(), b"original");
+            } else {
+                result.unwrap(); let completed = mgr.item(&it.id).unwrap();
+                assert_eq!(completed.status, DlStatus::Completed); assert!(completed.incomplete_folder.is_empty());
+                assert_eq!(std::fs::metadata(completed.full_path()).unwrap().len(), it.total_size as u64);
+                assert!(!std::path::Path::new(&it.part_path()).exists());
+                if policy == "Number" { assert_eq!(std::fs::read(it.full_path()).unwrap(), b"original"); assert!(completed.file_name.contains("(1)")); }
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    fn reply(status: StatusCode, headers: Vec<(&str, &str)>, body: Vec<u8>) -> axum::response::Response {
+        let mut response = axum::response::Response::builder().status(status);
+        for (name, value) in headers { response = response.header(name, value); }
+        response.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    async fn server(status: StatusCode, headers: Vec<(&'static str, &'static str)>, body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Router};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let url = format!("http://{}/file.bin", listener.local_addr().unwrap());
+        let app = Router::new().route("/file.bin", get(move || {
+            let headers = headers.clone();
+            let body = body.clone();
+            async move { reply(status, headers, body) }
+        }));
+        (url, tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); }))
+    }
+
+    fn assert_preserved(mgr: &Manager, it: &Item) {
+        let saved = mgr.item(&it.id).unwrap();
+        assert_eq!(saved.status, DlStatus::Paused);
+        assert_eq!(saved.downloaded, it.total_size);
+        assert_eq!(saved.total_size, it.total_size);
+        assert_eq!(std::fs::read(it.part_path()).unwrap(), vec![7u8; it.total_size as usize]);
+        assert!(!saved.segments.lock().is_empty());
+        assert!(!std::path::Path::new(&it.full_path()).exists());
+    }
+
+    #[tokio::test]
+    async fn changed_probe_pauses_without_mutating_saved_progress() {
+        for (status, headers, body, message) in [
+            (StatusCode::OK, vec![("content-type", "text/html; charset=utf-8")], b"login".to_vec(), "web page instead of the file"),
+            (StatusCode::PARTIAL_CONTENT, vec![("content-range", "bytes 0-0/2097152")], vec![7], "changed size"),
+            (StatusCode::PARTIAL_CONTENT, vec![("content-range", "bytes 0-0/1048576"), ("etag", "\"new\"")], vec![7], "server changed."),
+            (StatusCode::OK, vec![], vec![7; 1048576], "stopped allowing resume"),
+        ] {
+            let (url, task) = server(status, headers, body).await;
+            let (mgr, mut it, root) = fixture();
+            it.url = url;
+            it.http_validator = Some("\"old\"".into());
+            it.http_validator_url = Some(it.url.clone());
+            mgr.st.lock().items[0] = it.clone();
+            super::run(mgr.clone(), Run::test_run(&it.id)).await;
+            assert_preserved(&mgr, &it);
+            assert!(mgr.item(&it.id).unwrap().error_message.contains(message));
+            assert_eq!(mgr.item(&it.id).unwrap().http_validator, it.http_validator);
+            task.abort();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn html_is_rejected_in_probe_single_segments_and_mirror_samples() {
+        for mime in ["text/html", "application/xhtml+xml"] {
+            let (url, task) = server(StatusCode::OK, vec![("content-type", mime)], b"login".to_vec()).await;
+            let (mgr, mut it, root) = fixture();
+            it.url = url.clone();
+            // No saved progress: an expiry page must not create a completed file either.
+            it.segments.lock().clear();
+            mgr.st.lock().items[0] = it.clone();
+            let run = Run::test_run(&it.id);
+            let ctx = Ctx::new(mgr.clone(), run, &it);
+            ctx.sync_urls();
+            assert!(net::probe_file(&url, "", "test", 5, "file.bin").await.unwrap_err().msg.contains("web page"));
+            assert!(ctx.single(-1).await.unwrap_err().msg.contains("web page"));
+            let seg = Arc::new(Mutex::new(Segment { start: 0, end: 9, downloaded: 0, active: false }));
+            let file = std::fs::OpenOptions::new().write(true).open(it.part_path()).unwrap();
+            assert!(ctx.fetch(0, &seg, &file, "", &mut 0, &mut false).await.err().unwrap().msg.contains("web page"));
+            assert!(ctx.sample(0).await.unwrap_err().msg.contains("web page"));
+            assert_eq!(std::fs::read(it.part_path()).unwrap(), vec![7u8; it.total_size as usize]);
+            assert!(net::probe_file(&url, "", "test", 5, "page.HTM").await.is_ok());
+            drop(file);
+            task.abort();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ignored_segment_ranges_retry_then_fall_back_only_without_progress() {
+        use axum::{http::HeaderMap, routing::get, Router};
+        for progress in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let url = format!("http://{}/file.bin", listener.local_addr().unwrap());
+            let app = Router::new().route("/file.bin", get(move |headers: HeaderMap| {
+                let n = count.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if n == 0 {
+                        reply(StatusCode::PARTIAL_CONTENT, vec![("content-range", "bytes 0-0/1048576")], vec![7])
+                    } else {
+                        assert_eq!(headers.contains_key("range"), n <= 3);
+                        reply(StatusCode::OK, vec![], vec![7u8; 1048576])
+                    }
+                }
+            }));
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let (mgr, mut it, root) = fixture();
+            it.url = url;
+            if progress { it.segments.lock()[0].lock().downloaded -= 1; }
+            else { it.segments.lock().clear(); }
+            mgr.st.lock().items[0] = it.clone();
+            super::run(mgr.clone(), Run::test_run(&it.id)).await;
+            let saved = mgr.item(&it.id).unwrap();
+            if progress {
+                assert_eq!(saved.status, DlStatus::Paused);
+                assert!(saved.error_message.contains("stopped allowing resume"));
+                assert_eq!(std::fs::read(it.part_path()).unwrap(), vec![7; 1048576]);
+                assert_eq!(calls.load(Ordering::Relaxed), 4);
+            } else {
+                assert_eq!(saved.status, DlStatus::Completed);
+                assert_eq!(std::fs::read(it.full_path()).unwrap(), vec![7; 1048576]);
+                assert_eq!(calls.load(Ordering::Relaxed), 5);
+            }
+            task.abort();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn segment_changes_and_mirror_mismatches_preserve_bytes() {
+        for (headers, message) in [
+            (vec![("content-range", "bytes 0-3/1048576"), ("etag", "\"new\"")], "server changed."),
+            (vec![("content-range", "bytes 0-3/2097152")], "changed size"),
+            (vec![("content-range", "bytes 0-3/1048576")], "server changed."),
+        ] {
+            let (url, task) = server(StatusCode::PARTIAL_CONTENT, headers.clone(), vec![8; 4]).await;
+            let (mgr, mut it, root) = fixture();
+            it.url = url.clone();
+            it.http_validator = Some("\"old\"".into());
+            it.http_validator_url = Some(url.clone());
+            it.mirrors = vec![format!("{url}?mirror")];
+            mgr.st.lock().items[0] = it.clone();
+            let ctx = Ctx::new(mgr.clone(), Run::test_run(&it.id), &it);
+            ctx.sync_urls();
+            let seg = Arc::new(Mutex::new(Segment { start: 0, end: 3, downloaded: 0, active: false }));
+            let file = std::fs::OpenOptions::new().write(true).open(it.part_path()).unwrap();
+            let error = if headers.len() == 1 && headers[0].1.ends_with("1048576") {
+                *ctx.reference.lock().await = Some(vec![7; 8]);
+                ctx.ensure_same_content(1).await.unwrap_err()
+            } else {
+                ctx.fetch(0, &seg, &file, "", &mut 0, &mut false).await.err().unwrap()
+            };
+            assert_eq!(error.kind, ErrKind::Changed);
+            assert!(error.msg.contains(message));
+            assert_eq!(std::fs::read(it.part_path()).unwrap(), vec![7; 1048576]);
+            assert_eq!(seg.lock().downloaded, 0);
+            drop(file);
+            task.abort();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn single_connection_failure_keeps_received_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let url = format!("http://{}/file.bin", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 8192];
+            stream.read(&mut buf).await.unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let (mgr, mut it, root) = fixture();
+        it.url = url;
+        it.segments.lock().clear();
+        mgr.st.lock().items[0] = it.clone();
+        let run = Run::test_run(&it.id);
+        let ctx = Ctx::new(mgr, run.clone(), &it);
+        ctx.sync_urls();
+        assert_eq!(ctx.single(100).await.unwrap_err().kind, ErrKind::NoResume);
+        assert_eq!(std::fs::read(it.part_path()).unwrap(), b"partial");
+        assert_eq!(run.current.load(Ordering::Relaxed), 7);
+        assert_eq!(it.segments.lock()[0].lock().downloaded, 7);
+        task.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_on_range_probe_falls_back_and_preserves_partial_data() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let url = format!("http://{}/file.bin", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                count.fetch_add(1, Ordering::Relaxed);
+                if !request.contains("range:") {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n").await.unwrap();
+                }
+                // Dropping the ranged request produces the same premature EOF as a closed connection.
+            }
+        });
+        let probe = net::probe(&url, "", "test", 5).await.unwrap();
+        assert!(!probe.resumable);
+        assert_eq!(probe.total, 1048576);
+        let (mgr, mut it, root) = fixture();
+        it.url = url;
+        mgr.st.lock().items[0] = it.clone();
+        super::run(mgr.clone(), Run::test_run(&it.id)).await;
+        assert_preserved(&mgr, &it);
+        assert!(mgr.item(&it.id).unwrap().error_message.contains("stopped allowing resume"));
+        assert!(calls.load(Ordering::Relaxed) >= 4);
+        task.abort();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -917,11 +1192,12 @@ mod tests {
     }
 
     #[test]
-    fn changed_validator_discards_same_size_partial_data() {
+    fn changed_validator_preserves_same_size_partial_data() {
         for (saved, source, current, changed) in [
             (None, None, "\"new\"", false),
             (Some("\"old\""), None, "\"new\"", false),
             (Some("\"old\""), Some("https://example.invalid/file"), "\"new\"", true),
+            (Some("Wed, 21 Oct 2015 07:28:00 GMT"), Some("https://example.invalid/file"), "Thu, 22 Oct 2015 07:28:00 GMT", true),
             (Some("\"old\""), Some("https://example.invalid/file"), "Wed, 21 Oct 2015 07:28:00 GMT", false),
             (Some("Wed, 21 Oct 2015 07:28:00 GMT"), Some("https://example.invalid/file"), "\"new\"", false),
         ] {
@@ -931,10 +1207,11 @@ mod tests {
                 it.http_validator_url = source.map(str::to_string);
             });
             let ctx = Ctx::new(mgr.clone(), Run::test_run(&it.id), &it);
-            ctx.apply_probe(&net::Probe { url: "https://example.invalid/file".into(), total: it.total_size, resumable: true, file_name: None, sha256: None, validator: Some(current.into()) });
-            assert_eq!(it.segments.lock().is_empty(), changed);
-            assert_eq!(std::path::Path::new(&it.part_path()).exists(), !changed);
-            assert_eq!(mgr.item(&it.id).unwrap().http_validator.as_deref(), if changed { Some(current) } else { saved });
+            let result = ctx.apply_probe(&net::Probe { url: "https://example.invalid/file".into(), total: it.total_size, resumable: true, file_name: None, sha256: None, validator: Some(current.into()) });
+            assert_eq!(result.is_err(), changed);
+            assert!(!it.segments.lock().is_empty());
+            assert!(std::path::Path::new(&it.part_path()).exists());
+            assert_eq!(mgr.item(&it.id).unwrap().http_validator.as_deref(), saved);
             assert_eq!(mgr.item(&it.id).unwrap().http_validator_url.as_deref(), source);
             std::fs::remove_dir_all(root).unwrap();
         }
@@ -961,7 +1238,7 @@ mod tests {
         mgr.st.lock().items[0] = it.clone();
         let ctx = Ctx::new(mgr.clone(), Run::test_run(&it.id), &it);
         ctx.sync_urls();
-        ctx.apply_probe(&net::Probe { url: mirror, total: it.total_size, resumable: true, file_name: None, sha256: None, validator: Some("\"mirror\"".into()) });
+        ctx.apply_probe(&net::Probe { url: mirror, total: it.total_size, resumable: true, file_name: None, sha256: None, validator: Some("\"mirror\"".into()) }).unwrap();
         assert!(!it.segments.lock().is_empty());
         assert!(std::path::Path::new(&it.part_path()).exists());
         assert_eq!(ctx.validator_for(&it.url).as_deref(), Some("\"primary\""));
@@ -976,4 +1253,18 @@ mod tests {
         drop(file);
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn disk_full_write_error_keeps_http_segments_and_partial_file() {
+        let (mgr, it, root) = fixture();
+        let before = std::fs::read(it.part_path()).unwrap();
+        let error = DlError::from(std::io::Error::from_raw_os_error(112));
+        assert!(local_fault(&error));
+        mgr.with_item(&it.id, |i| { i.downloaded = 1234; error.apply_download_error(i); });
+        let paused = mgr.item(&it.id).unwrap();
+        assert_eq!(paused.status, DlStatus::Paused); assert_eq!(paused.downloaded, 1234);
+        assert_eq!(paused.segments.lock()[0].lock().downloaded, it.total_size);
+        assert_eq!(std::fs::read(it.part_path()).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 }

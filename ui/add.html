@@ -7,10 +7,14 @@
 <link rel="stylesheet" href="add.css">
 </head>
 <body>
+<div id="windowArt" aria-hidden="true"></div>
 <main id="add">
+  <header data-tauri-decorum-tb data-tauri-drag-region><span id="addGlyph" data-tauri-drag-region></span><b data-tauri-drag-region>Add download</b><span id="headerNote" data-tauri-drag-region>Paste a link to begin</span></header>
   <div class="scroll">
     <div class="linkbar">
-      <textarea id="urls" rows="1" wrap="off" spellcheck="false" class="mono" placeholder="Paste a link: web, magnet or .torrent" title="One link per line for a batch. A number range like part[01-12].zip expands automatically."></textarea>
+      <div class="link-input"><span id="linkGlyph" aria-hidden="true"></span>
+      <textarea aria-label="Download links" id="urls" rows="1" wrap="off" spellcheck="false" class="mono" placeholder="Paste a link: web, magnet or .torrent" title="One link per line for a batch. A number range like part[01-12].zip expands automatically."></textarea>
+      </div>
       <span id="linkCount" class="count" hidden></span>
       <button id="expand" class="ghost iconbtn" title="Show every line"></button>
       <button id="copyLink" class="ghost iconbtn" title="Copy the link"></button>
@@ -18,12 +22,16 @@
     </div>
     <div id="linkHint" class="hint" hidden>One link per line for a batch: web links, magnet links or .torrent files. A number range like part[01-12].zip expands automatically.</div>
 
-    <div id="info" class="card">Paste a link to see its size and name.</div>
+    <section id="detected" class="type-file">
+      <div id="detectedArt" aria-hidden="true"></div><div id="typeWatermark" aria-hidden="true"></div>
+      <div id="detectedIcon"></div><div class="detected-copy"><div id="chips"></div><h1 id="detectedTitle">New download</h1><div id="detectedSize" class="mono"></div></div>
+    </section>
+    <div id="info" role="status">Paste a link to see its size and name.</div>
 
     <section id="torrentPanel" hidden>
       <div class="thead-row">
         <b id="torrentSel" class="grow"></b>
-        <input id="tFilter" type="text" placeholder="Filter files" spellcheck="false">
+        <input aria-label="Filter files" id="tFilter" type="text" placeholder="Filter files" spellcheck="false">
         <button id="tAll" class="small" title="Tick every file shown">All</button>
         <button id="tNone" class="small" title="Untick every file shown">None</button>
       </div>
@@ -33,42 +41,46 @@
       </div>
     </section>
 
+    <div class="grid">
+      <span>Save to</span>
+      <div class="row"><input id="folder" type="text" class="grow mono" spellcheck="false"><button id="browse">Browse…</button></div>
+      <span></span><span id="freeSpace" role="status">Checking free space…</span>
+      <span>File name</span><input id="name" class="mono" type="text" spellcheck="false">
+      <label for="queue">Queue</label><div class="row queue-row"><select id="queue"></select><label data-notorrent for="conn">Connections</label><input data-notorrent id="conn" type="number" min="1" max="64" aria-label="Connections"><b id="connVal" hidden></b></div>
+      <span>Speed limits</span>
+      <div class="row"><label for="limit" class="muted">Download</label>
+        <span id="limitBox" class="speedbox" title="Pick a preset or type your own: 750k, 2 MB/s… (plain numbers are KB/s, 0 = unlimited)"><input id="limit" type="text"><button title="Presets" aria-label="Choose speed limit"></button></span>
+      </div>
+      <span data-torrentonly>Upload limit</span>
+      <div data-torrentonly class="row wrap">
+        <span class="muted">while downloading</span>
+        <span id="upBox" class="speedbox" title="How fast this torrent shares while it's still downloading. Type 20k, 1 MB/s… or pick “No upload”. Unlimited = only the limits in Settings apply."><input id="upLimit" type="text"><button title="Presets" aria-label="Choose speed limit"></button></span>
+        <span class="muted">when finished</span>
+        <span id="seedBox" class="speedbox" title="How fast it shares once it's finished (seeding). Type 20k, 1 MB/s… or pick “No upload”. Unlimited = only the limits in Settings apply."><input id="seedLimit" type="text"><button title="Presets" aria-label="Choose speed limit"></button></span>
+      </div>
+    </div>
+
+    <details id="advanced">
+      <summary>Advanced: checksum, backup links and request headers</summary>
     <div id="videoBlock">
       <label class="check" id="videoRow"><input type="checkbox" id="video"><span>Download as video / audio with yt-dlp (YouTube and 1000+ other sites)</span></label>
       <div id="videoPanel" class="row" hidden style="margin:6px 0 0 23px">
         <span>Quality</span>
         <select id="format"></select>
         <label class="check" title="Download every video of the playlist into its own folder"><input type="checkbox" id="playlist"><span>Whole playlist</span></label>
+        <label title="Only this part of the video, e.g. 1:30-2:45 (leave empty for the whole video)"><span>Part</span>
+          <input id="section" type="text" class="mono" spellcheck="false" placeholder="start-end" style="width:110px"></label>
+      </div>
+      <div id="playlistPicker" hidden style="margin:6px 0 0 23px">
+        <div class="row"><span class="hint grow" id="pickCount"></span>
+          <button type="button" id="pickAll">All</button><button type="button" id="pickNone">None</button>
+          <input id="pickRange" type="text" class="mono" spellcheck="false" placeholder="e.g. 1-10,15" style="width:110px" title="Tick these numbers, then press Enter">
+        </div>
+        <div id="pickList" style="max-height:160px;overflow:auto;margin-top:4px"></div>
       </div>
     </div>
 
-    <div class="grid">
-      <span data-notorrent>File name</span>
-      <input data-notorrent id="name" type="text" spellcheck="false">
-      <span>Save to</span>
-      <div class="row"><input id="folder" type="text" class="grow" spellcheck="false"><button id="browse">Browse…</button></div>
-      <span data-notorrent>Connections</span>
-      <div data-notorrent class="row"><input id="conn" type="range" min="1" max="64" class="grow"><b id="connVal" style="width:26px;text-align:right"></b></div>
-      <span data-notorrent>Speed limit</span>
-      <span data-torrentonly>Download limit</span>
-      <div class="speed-queue">
-        <span id="limitBox" class="speedbox" title="Pick a preset or type your own: 750k, 2 MB/s… (plain numbers are KB/s, 0 = unlimited)"><input id="limit" type="text"><button title="Presets">▾</button></span>
-        <label class="muted" for="queue">Queue</label>
-        <select id="queue"></select>
-      </div>
-      <span data-torrentonly>Upload limit</span>
-      <div data-torrentonly class="row wrap">
-        <span class="muted">while downloading</span>
-        <span id="upBox" class="speedbox" title="How fast this torrent shares while it's still downloading. Type 20k, 1 MB/s… or pick “No upload”. Unlimited = only the limits in Settings apply."><input id="upLimit" type="text"><button title="Presets">▾</button></span>
-        <span class="muted">when finished</span>
-        <span id="seedBox" class="speedbox" title="How fast it shares once it's finished (seeding). Type 20k, 1 MB/s… or pick “No upload”. Unlimited = only the limits in Settings apply."><input id="seedLimit" type="text"><button title="Presets">▾</button></span>
-      </div>
-      <span>When it's done</span>
-      <label class="check"><input type="checkbox" id="openDone"><span>Open it</span></label>
-    </div>
 
-    <details id="advanced">
-      <summary>Advanced: checksum, backup links and request headers</summary>
       <div class="hint" style="margin:8px 0 6px">Expected checksum (MD5 / SHA-1 / SHA-256 / SHA-512). The file is verified when it finishes.</div>
       <input id="hash" type="text" class="mono" spellcheck="false" style="width:100%">
       <div class="hint" style="margin:10px 0 6px">Backup links (mirrors) for the same file, one per line. Connections are spread over all of them, and if one dies the download continues from the others.</div>
@@ -78,9 +90,10 @@
     </details>
   </div>
   <footer>
+    <label class="check"><input type="checkbox" id="openDone"><span>Open it when finished</span></label>
     <button id="cancel">Cancel</button>
     <button id="later" title="Add to the list (and to the chosen queue) without starting">Download later</button>
-    <button id="start" class="primary">Start download</button>
+    <button id="start" class="primary"><span id="startGlyph" aria-hidden="true"></span>Start download</button>
   </footer>
 </main>
 <script src="common.js"></script>

@@ -8,6 +8,7 @@ mod http_dl;
 mod manager;
 mod model;
 mod net;
+mod notify;
 mod store;
 mod torrent;
 mod update;
@@ -15,6 +16,7 @@ mod util;
 mod video;
 mod webview_guard;
 mod win;
+mod watched;
 
 use manager::Manager;
 use model::*;
@@ -65,18 +67,82 @@ const TORRENT_RULE: &str = "FluxDM torrent peers";
 
 // ------------------------------------------------------------------ windows
 
-fn window_theme(value: &str) -> Option<tauri::Theme> {
-    match value.to_ascii_lowercase().as_str() {
-        "light" => Some(tauri::Theme::Light),
-        "dark" => Some(tauri::Theme::Dark),
-        _ => None,
-    }
+fn window_theme(_value: &str) -> Option<tauri::Theme> {
+    Some(tauri::Theme::Dark)
 }
 
 fn apply_window_theme(app: &AppHandle, value: &str) {
     let theme = window_theme(value);
     for window in app.webview_windows().values() {
         let _ = window.set_theme(theme);
+    }
+}
+
+/// The app icon themes (Settings → Appearance): the hue the gold parts take, how much of their colour they keep,
+/// and an optional tint for the graphite tile (hue, added saturation). Light and shade stay those of the
+/// original artwork, so every theme looks as finished as the original. The page does the same for the in-app
+/// logo (`ICON_THEMES` in common.js).
+/// (hue of the gold parts, colour kept, tile tint as (hue, added saturation)); None = the original artwork.
+type IconTint = Option<(f32, f32, Option<(f32, f32)>)>;
+const ICON_THEMES: [(&str, IconTint); 5] = [
+    ("heat", None),
+    ("ice", Some((195.0, 0.9, Some((220.0, 0.18))))),
+    ("neon", Some((320.0, 1.0, Some((275.0, 0.2))))),
+    ("emerald", Some((152.0, 0.9, Some((160.0, 0.15))))),
+    ("mono", Some((30.0, 0.04, None))),
+];
+
+fn rgb_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let d = max - min;
+    let h = if d == 0.0 { 0.0 } else if max == r { 60.0 * ((g - b) / d).rem_euclid(6.0) } else if max == g { 60.0 * ((b - r) / d + 2.0) } else { 60.0 * ((r - g) / d + 4.0) };
+    (h, if max > 0.0 { d / max } else { 0.0 }, max)
+}
+
+fn hsv_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match (h.rem_euclid(360.0) / 60.0) as u32 % 6 { 0 => (c, x, 0.0), 1 => (x, c, 0.0), 2 => (0.0, c, x), 3 => (0.0, x, c), 4 => (x, 0.0, c), _ => (c, 0.0, x) };
+    (r + v - c, g + v - c, b + v - c)
+}
+
+/// The icon in one of the themes; "heat" or an unknown name is the original artwork.
+fn tint_icon(rgba: &[u8], width: u32, height: u32, theme: &str) -> tauri::image::Image<'static> {
+    let mut out = rgba.to_vec();
+    let Some((hue, sat, tile)) = ICON_THEMES.iter().find(|(name, _)| *name == theme).and_then(|(_, t)| *t) else {
+        return tauri::image::Image::new_owned(out, width, height);
+    };
+    for px in out.as_chunks_mut::<4>().0 {
+        if px[3] == 0 { continue; }
+        let (h, s, v) = rgb_hsv(px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0);
+        let (r, g, b) = if s >= 0.18 && (h < 75.0 || h > 330.0) {
+            hsv_rgb(hue, (s * sat).min(1.0), v)
+        } else if s < 0.18 && v < 0.5 {
+            let Some((tile_hue, add)) = tile else { continue };
+            hsv_rgb(tile_hue, (s + add).min(1.0), v)
+        } else {
+            continue;
+        };
+        px[0] = (r * 255.0).round() as u8;
+        px[1] = (g * 255.0).round() as u8;
+        px[2] = (b * 255.0).round() as u8;
+    }
+    tauri::image::Image::new_owned(out, width, height)
+}
+fn app_icon(app: &AppHandle) -> Option<tauri::image::Image<'static>> {
+    let base = app.default_window_icon()?;
+    let s = app.state::<Arc<Manager>>().settings();
+    Some(tint_icon(base.rgba(), base.width(), base.height(), &s.icon_theme))
+}
+
+/// Puts the chosen icon colour on the tray icon and on every open window (their taskbar buttons follow).
+fn apply_app_icon(app: &AppHandle) {
+    let Some(icon) = app_icon(app) else { return };
+    for w in app.webview_windows().values() {
+        let _ = w.set_icon(icon.clone());
+    }
+    if let Some(t) = app.tray_by_id("main") {
+        let _ = t.set_icon(Some(icon));
     }
 }
 
@@ -111,20 +177,24 @@ pub fn show_add(app: &AppHandle, req: AddRequest) {
     // Windows are built from an async task: building one on the event-loop thread can deadlock WebView2.
     let h = app.clone();
     tauri::async_runtime::spawn(async move {
-        // A new webview is white until its page paints — start dark when the system is dark.
-        let dark = h.get_webview_window("main").and_then(|w| w.theme().ok()) == Some(tauri::Theme::Dark);
-        let bg = if dark { tauri::window::Color(0x21, 0x22, 0x27, 255) } else { tauri::window::Color(255, 255, 255, 255) };
+        // Match the dark page before its first paint.
+        let bg = tauri::window::Color(0x07, 0x09, 0x0d, 255);
         let b = WebviewWindowBuilder::new(&h, &label, WebviewUrl::App("add.html".into()))
             .theme(window_theme(&h.state::<Arc<Manager>>().settings().theme))
             .background_color(bg)
             .title("Add download — FluxDM")
-            .inner_size(660.0, 640.0)
+            .inner_size(760.0, 640.0)
             .min_inner_size(520.0, 480.0)
             .center()
             .always_on_top(!main_focused)
             .disable_drag_drop_handler();
         if let Ok(w) = b.build() {
             let _ = w.set_theme(window_theme(&h.state::<Arc<Manager>>().settings().theme));
+            if let Some(icon) = app_icon(&h) { let _ = w.set_icon(icon); }
+            {
+                use tauri_plugin_decorum::WebviewWindowExt;
+                let _ = w.create_overlay_titlebar();
+            }
             let key = label.clone();
             w.on_window_event(move |event| {
                 if matches!(event, WindowEvent::Destroyed) { PENDING_ADD.lock().remove(&key); }
@@ -207,15 +277,16 @@ fn toast_window(app: &AppHandle) {
     let _ = WebviewWindowBuilder::new(app, "toast", WebviewUrl::App("toast.html".into()))
         .theme(window_theme(&app.state::<Arc<Manager>>().settings().theme))
         .title("FluxDM")
-        .inner_size(360.0, 104.0)
+        .inner_size(440.0, 190.0)
         .decorations(false)
+        .transparent(true)
         .resizable(false)
         .skip_taskbar(true)
         .always_on_top(true)
         .focused(false)
         .focusable(false)
         .visible(false)
-        .shadow(true)
+        .shadow(false) // the card draws its own border; a window shadow adds a second, square-cornered frame
         .build();
 }
 
@@ -238,18 +309,22 @@ fn show_toast(app: &AppHandle, mut payload: Value) {
 
 /// The page puts a toast on screen: place and show the window (it never takes focus), and arm the backstop.
 #[tauri::command]
-fn toast_show(app: AppHandle, gen: u64) {
+fn toast_show(app: AppHandle, gen: u64, height: Option<f64>, countdown: Option<bool>) {
     TOAST_SHOWN.store(gen, Ordering::SeqCst);
     let Some(w) = app.get_webview_window("toast") else { return };
-    if !w.is_visible().unwrap_or(false) {
+    let _ = w.set_size(tauri::LogicalSize::new(440.0, height.unwrap_or(190.0).clamp(100.0, 480.0)));
+    {
         if let Ok(Some(mon)) = w.primary_monitor() {
             let wa = mon.work_area();
             let scale = mon.scale_factor();
-            let (tw, th) = ((360.0 * scale) as i32, (104.0 * scale) as i32);
+            let size = w.outer_size().unwrap_or(tauri::PhysicalSize::new((440.0 * scale) as u32, (190.0 * scale) as u32));
+            let (tw, th) = (size.width as i32, size.height as i32);
             let x = wa.position.x + wa.size.width as i32 - tw - (16.0 * scale) as i32;
             let y = wa.position.y + wa.size.height as i32 - th - (16.0 * scale) as i32;
             let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
         }
+    }
+    if !w.is_visible().unwrap_or(false) {
         // tao already shows this window without activating it; the webview can still pull focus, so check.
         let prev = win::foreground();
         let _ = w.show();
@@ -264,7 +339,7 @@ fn toast_show(app: AppHandle, gen: u64) {
         }
     }
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(TOAST_BACKSTOP).await;
+        tokio::time::sleep(if countdown.unwrap_or(false) { Duration::from_secs(75) } else { TOAST_BACKSTOP }).await;
         if TOAST_SHOWN.compare_exchange(gen, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             let _ = w.hide();
             let _ = w.emit("toast-reset", ());
@@ -423,7 +498,7 @@ async fn apply_servers(app: &AppHandle, mgr: &Arc<Manager>, quiet: bool, local: 
     if local {
         api::stop_local();
         if s.local_api_enabled && !api::start_local(mgr.clone(), app.clone(), s.local_api_port as u16).await {
-            mgr.toast("Browser bridge is off", &format!("Port {} is in use by another program.", s.local_api_port), None);
+            mgr.warn_toast("Browser bridge is off", &format!("Port {} is in use by another program.", s.local_api_port));
         }
     }
     if !remote {
@@ -432,7 +507,7 @@ async fn apply_servers(app: &AppHandle, mgr: &Arc<Manager>, quiet: bool, local: 
     api::stop_remote();
     if s.remote_enabled {
         if !api::start_remote(mgr.clone(), app.clone(), s.remote_port as u16).await {
-            mgr.toast("Phone remote is off", &format!("Port {} is in use.", s.remote_port), None);
+            mgr.warn_toast("Phone remote is off", &format!("Port {} is in use.", s.remote_port));
             return;
         }
         let port = s.remote_port;
@@ -442,7 +517,7 @@ async fn apply_servers(app: &AppHandle, mgr: &Arc<Manager>, quiet: bool, local: 
                 return;
             }
             if quiet {
-                m.toast("Phone remote is blocked", "Windows Firewall blocks your phone. Settings → Phone remote → Allow through firewall.", None);
+                m.warn_toast("Phone remote is blocked", "Windows Firewall blocks your phone. Settings → Phone remote → Allow through firewall.");
             } else {
                 let _ = h.emit_to("main", "offer-firewall", json!({ "kind": "remote" }));
             }
@@ -462,6 +537,33 @@ fn init(mgr: M) -> Value {
         "version": update::current_version(),
         "dataDir": store::data_dir(),
     })
+}
+
+/// While "Start with Windows" is off, the main window asks about it once every two weeks.
+const STARTUP_ASK_DAYS: i64 = 14;
+
+#[tauri::command]
+fn startup_prompt_due(mgr: M) -> bool {
+    if std::env::var_os("FLUXDM_DATA").is_some() {
+        return false; // an isolated test copy never touches the real startup entry
+    }
+    let s = mgr.settings();
+    !s.start_with_windows && s.startup_asked_at.is_none_or(|t| chrono::Local::now() - t >= chrono::Duration::days(STARTUP_ASK_DAYS))
+}
+
+#[tauri::command]
+fn startup_prompt_answer(mgr: M, enable: bool) -> bool {
+    if enable {
+        win::set_start_with_windows(true);
+    }
+    let on = win::starts_with_windows();
+    {
+        let mut st = mgr.st.lock();
+        st.settings.startup_asked_at = Some(chrono::Local::now());
+        st.settings.start_with_windows = on;
+    }
+    mgr.save();
+    on
 }
 
 #[tauri::command]
@@ -490,10 +592,10 @@ async fn pause(mgr: M<'_>, ids: Vec<String>) -> R<()> {
 async fn toggle(mgr: M<'_>, ids: Vec<String>) -> R<()> {
     let m = mgr.inner().clone();
     for id in ids {
-        if m.is_running(&id) {
+        if m.is_running(&id) || m.item(&id).is_some_and(|i| matches!(i.status, DlStatus::Verifying | DlStatus::Queued) || i.seeding) {
             let m2 = m.clone();
             tauri::async_runtime::spawn(async move { m2.pause(&id).await });
-        } else if m.with_item(&id, |i| i.status != DlStatus::Completed).unwrap_or(false) {
+        } else if m.with_item(&id, |i| i.status != DlStatus::Completed || i.is_torrent).unwrap_or(false) {
             m.start(&id);
         }
     }
@@ -555,6 +657,12 @@ fn set_items(mgr: M, ids: Vec<String>, patch: Value) {
     for id in &ids {
         let running = mgr.is_running(id);
         mgr.with_item(id, |it| {
+            if !running {
+                if let Some(v) = patch["existingFilePolicy"].as_str().filter(|v| ["Ask", "Number", "Overwrite", "Skip"].contains(v)) {
+                    it.existing_file_policy = v.into();
+                    if v == "Skip" && it.error_message.contains("file conflict dialog") { it.error_message = "Skipped: the destination file already exists.".into(); }
+                }
+            }
             if let Some(v) = patch["connections"].as_i64() {
                 it.set_connections(v as i32);
             }
@@ -668,9 +776,18 @@ fn details(mgr: M, id: String) -> Value {
     json!({
         "segments": segs,
         "history": it.speed_history,
+        "uploadHistory": it.upload_history,
+        "started": it.last_try.map(|t| t.format("%H:%M").to_string()),
+        "retries": it.retry_count,
+        "note": it.note,
+        "sharingRatio": s.torrent_seed_ratio,
+        "sharingMinutes": s.torrent_seed_minutes,
+        "sharingAction": s.torrent_seed_action,
+        "title": covers::display_title(&it),
         "segInfo": seg_info,
         "torrent": if it.is_torrent { mgr.torrents.details(&it) } else { Value::Null },
         "cover": covers::cover_url(&it, &s),
+        "game": covers::is_game(&it), "artColor": it.art_color, "banner": covers::banner_url(&it, &s),
     })
 }
 
@@ -721,6 +838,17 @@ fn set_global_limit(mgr: M, kbps: i32) {
 }
 
 #[tauri::command]
+fn set_global_upload_limit(mgr: M, kbps: i32) {
+    {
+        let mut st = mgr.st.lock();
+        st.settings.torrent_upload_limit_kbps = kbps.max(-1);
+        st.settings.torrent_seeding_limit_kbps = kbps.max(-1);
+    }
+    mgr.mark_dirty();
+    mgr.push_list();
+}
+
+#[tauri::command]
 fn parse_speed(text: String) -> Option<i32> {
     fmt::parse_speed(&text)
 }
@@ -731,22 +859,57 @@ fn free_space(folder: String) -> Option<i64> {
 }
 
 #[tauri::command]
-fn run_post_action(app: AppHandle, action: String, force: bool) {
+async fn add_art(mgr: M<'_>, name: String, url: Option<String>, headers: Option<String>) -> R<Option<Value>> {
+    let s = mgr.settings();
+    if !s.lookup_covers_online || !s.show_icons { return Ok(None); }
+    Ok(covers::preview(&name, url.as_deref().unwrap_or(""), headers.as_deref().unwrap_or("")).await)
+}
+
+#[tauri::command]
+fn toast_item(mgr: M, id: String) -> Value {
+    let Some(it) = mgr.item(&id) else { return Value::Null };
+    let s = mgr.settings();
+    json!({ "seeding": it.seeding, "upSpeed": fmt::speed(it.upload_speed), "ratio": s.torrent_seed_ratio,
+        "game": covers::is_game(&it), "artColor": it.art_color, "banner": covers::banner_url(&it, &s), "icon": covers::icon_url(&it, &s), "status": it.status })
+}
+
+#[tauri::command]
+fn countdown_choice(app: AppHandle, token: String, now: bool) {
+    let _ = app.emit_to("main", "countdown-choice", json!({ "token": token, "now": now }));
+}
+
+#[tauri::command]
+fn countdown_toast(app: AppHandle, payload: Value) {
+    let _ = app.emit_to("toast", "countdown-state", payload.clone());
+    if payload["seconds"] == 60 && payload["closed"] != true {
+        let mut p = payload;
+        p["kind"] = "countdown".into();
+        show_toast(&app, p);
+    }
+}
+
+#[tauri::command]
+fn run_post_action(app: AppHandle, action: String, force: bool) -> R<()> {
+    // Recheck when the countdown ends: downloads may have started during it.
+    if app.state::<Arc<Manager>>().has_pending_downloads() {
+        return Err("Other downloads are still running or waiting. The finish action was skipped.".into());
+    }
     let a = match action.as_str() {
         "Exit" => {
             let h = app.clone();
             tauri::async_runtime::spawn(async move { exit_app(&h).await });
-            return;
+            return Ok(());
         }
         "Sleep" => PostAction::Sleep,
         "Hibernate" => PostAction::Hibernate,
         "Shutdown" => PostAction::Shutdown,
         "Restart" => PostAction::Restart,
-        _ => return,
+        _ => return Ok(()),
     };
     let mgr = app.state::<Arc<Manager>>();
     mgr.save();
     win::run_post_action(a, force);
+    Ok(())
 }
 
 #[tauri::command]
@@ -821,9 +984,16 @@ fn add_init(window: tauri::WebviewWindow, mgr: M) -> Value {
         "videoFormat": s.default_video_format,
         "seedRatio": s.torrent_seed_ratio,
         "queues": queues,
+        "lastQueue": mgr.add_queue_choice(req.queue.as_deref()),
         "formats": video::FORMATS.iter().map(|(k, l)| json!({ "key": k, "label": l })).collect::<Vec<_>>(),
         "ytInstalled": video::is_installed(),
     })
+}
+
+#[tauri::command]
+fn remember_add_queue(mgr: M, name: String) {
+    mgr.remember_add_queue(&name);
+    mgr.save();
 }
 
 #[tauri::command]
@@ -831,11 +1001,76 @@ fn add_take_links(window: tauri::WebviewWindow) -> String {
     PENDING_ADD.lock().get_mut(window.label()).map(|r| std::mem::take(&mut r.urls)).unwrap_or_default()
 }
 
+/// Pasted or dropped text → one entry per link. Invisible characters that chat apps and web pages add
+/// (zero-width spaces, BOM, no-break spaces) are dropped, wrapping quotes/brackets and trailing punctuation are
+/// trimmed, and several links on one line are split apart (a line with one link and spaces is kept whole: it
+/// may be a local path).
+fn pasted_links(text: &str) -> Vec<String> {
+    let text: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}'))
+        .map(|c| if matches!(c, '\u{00A0}' | '\u{202F}' | '\u{2007}') { ' ' } else { c })
+        .collect();
+    let tidy = |s: &str| -> String {
+        let mut s = s.trim();
+        loop {
+            let before = s;
+            for (a, b) in [('"', '"'), ('\'', '\''), ('<', '>'), ('(', ')'), ('[', ']'), ('“', '”'), ('«', '»')] {
+                if s.len() > 2 && s.starts_with(a) && s.ends_with(b) { s = s[a.len_utf8()..s.len() - b.len_utf8()].trim(); }
+            }
+            s = s.trim_matches('"').trim_end_matches([',', ';', '.']).trim();
+            if s == before { break; }
+        }
+        s.to_string()
+    };
+    let mut out = vec![];
+    for line in text.split(['\n', '\r']) {
+        let starts = line.matches("://").count() + line.matches("magnet:").count();
+        if starts > 1 {
+            out.extend(line.split_whitespace().map(tidy).filter(|l| !l.is_empty()));
+        } else {
+            let l = tidy(line);
+            if !l.is_empty() { out.push(l); }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod icon_tests {
+    #[test]
+    fn themes_change_only_the_colour() {
+        // gold, graphite, transparent
+        let px = [240u8, 160, 60, 255, 40, 42, 48, 255, 0, 0, 0, 0];
+        assert_eq!(super::tint_icon(&px, 3, 1, "heat").rgba(), &px[..]);
+        assert_eq!(super::tint_icon(&px, 3, 1, "unknown").rgba(), &px[..]);
+        let ice = super::tint_icon(&px, 3, 1, "ice");
+        let c = ice.rgba();
+        assert!(c[2] > c[0], "gold became blue: {:?}", &c[0..3]);
+        assert_eq!(c[0..3].iter().max(), px[0..3].iter().max(), "same brightness as the original");
+        assert_eq!(&c[8..12], &px[8..12], "transparency untouched");
+        let mono = super::tint_icon(&px, 3, 1, "mono");
+        let m = mono.rgba();
+        assert!(m[0].abs_diff(m[2]) < 20, "mono is grey: {:?}", &m[0..3]);
+        assert_eq!(&m[4..8], &px[4..8], "mono keeps the graphite tile");
+    }
+}
+#[cfg(test)]
+mod paste_tests {
+    #[test]
+    fn pasted_links_are_cleaned_and_split() {
+        let got = super::pasted_links("\u{FEFF}\"https://a.example/x.zip\"\u{200B}\n<https://b.example/y.zip>,\n\nhttps://c.example/1 https://c.example/2\nC:\\My Files\\t.torrent\n");
+        assert_eq!(got, vec!["https://a.example/x.zip", "https://b.example/y.zip", "https://c.example/1", "https://c.example/2", "C:\\My Files\\t.torrent"]);
+        assert!(super::pasted_links(" \u{00A0} \n").is_empty());
+    }
+}
+
 #[tauri::command]
 fn classify(mgr: M, text: String) -> Value {
     // Every line → links (batch ranges expanded), and what kind they are.
     let mut urls: Vec<String> = vec![];
-    for l in text.split('\n').map(|l| l.trim().trim_matches('"')).filter(|l| !l.is_empty()) {
+    for l in pasted_links(&text) {
+        let l = l.as_str();
         let expanded = if net::is_magnet(l) { vec![l.to_string()] } else { net::expand_pattern(l) };
         for u in expanded {
             if net::is_download_source(&u) && !urls.contains(&u) {
@@ -865,7 +1100,18 @@ fn folder_for(mgr: M, name: String) -> String {
 #[tauri::command]
 async fn video_probe(mgr: M<'_>, url: String) -> R<Value> {
     let s = mgr.settings();
-    video::probe(&url, &s).await.map_err(|e| e.msg)
+    let mut v = video::probe(&url, &s).await.map_err(|e| e.msg)?;
+    // Already in the list? Same video id on the same site (ids are case-sensitive), or the same link.
+    let id = v["id"].as_str().unwrap_or("").to_string();
+    let dup = mgr.st.lock().items.iter().find(|i| i.is_video && ((!id.is_empty() && i.video_id == id) || i.url.trim() == url.trim())).map(|i| i.file_name.clone());
+    v["duplicate"] = json!(dup);
+    Ok(v)
+}
+
+#[tauri::command]
+async fn discord_test(url: String) -> R<String> {
+    notify::post(&url, "👋 FluxDM test message: notifications will arrive in this channel.").await?;
+    Ok("Sent. Check the Discord channel.".into())
 }
 
 #[tauri::command]
@@ -908,12 +1154,20 @@ struct AddSubmit {
     video_format: String,
     playlist: bool,
     video_title: Option<String>,
+    #[serde(default)]
+    video_items: String,
+    #[serde(default)]
+    video_section: String,
+    #[serde(default)]
+    video_id: String,
     probe_total: Option<i64>,
     probe_resumable: Option<bool>,
     torrent_name: Option<String>,
     torrent_hash: Option<String>,
     torrent_file: Option<String>,
     skipped: Option<Vec<i32>>,
+    #[serde(default)]
+    file_priorities: std::collections::HashMap<i32, u8>,
     wanted_size: Option<i64>,
     #[serde(default)]
     open_when_done: bool,
@@ -921,10 +1175,11 @@ struct AddSubmit {
 }
 
 #[tauri::command]
-fn add_submit(window: tauri::WebviewWindow, mgr: M, req: AddSubmit) -> R<()> {
+fn add_submit(window: tauri::WebviewWindow, mgr: M, mut req: AddSubmit) -> R<()> {
     if req.urls.is_empty() {
         return Err("Paste at least one link.".into());
     }
+    if !mgr.st.lock().queues.iter().any(|q| q.name == req.queue) { req.queue.clear(); }
     let s = mgr.settings();
     let folder = if req.folder.trim().is_empty() { s.default_folder.clone() } else { req.folder.trim().to_string() };
     if !std::path::Path::new(&folder).is_absolute() {
@@ -946,6 +1201,7 @@ fn add_submit(window: tauri::WebviewWindow, mgr: M, req: AddSubmit) -> R<()> {
                     it.torrent_file = req.torrent_file.clone().unwrap_or_default();
                     it.info_hash = req.torrent_hash.clone().unwrap_or_default();
                     it.total_size = req.wanted_size.unwrap_or(-1);
+                    it.file_priorities = req.file_priorities.iter().filter(|(_, level)| **level >= 1 && **level <= 4).map(|(i, level)| (*i, *level)).collect();
                 }
                 it.speed_limit_kbps = req.limit_kbps;
                 it.upload_limit_kbps = req.upload_limit_kbps.max(-1);
@@ -958,6 +1214,11 @@ fn add_submit(window: tauri::WebviewWindow, mgr: M, req: AddSubmit) -> R<()> {
             for u in &req.urls {
                 let title = if single { req.video_title.as_deref() } else { None };
                 let mut it = mgr.create_video_item(u, title, &req.video_format, req.playlist, req.folder_edited.then_some(folder.as_str()));
+                if single {
+                    if req.playlist { it.video_playlist_items = video::playlist_items(&req.video_items)?; }
+                    it.video_section = video::section(&req.video_section)?;
+                    it.video_id = req.video_id.trim().to_string();
+                }
                 it.set_connections(req.connections);
                 it.speed_limit_kbps = req.limit_kbps;
                 it.queue_name = req.queue.clone();
@@ -998,6 +1259,7 @@ fn add_submit(window: tauri::WebviewWindow, mgr: M, req: AddSubmit) -> R<()> {
         it.open_when_done = req.open_when_done;
         it.headers = req.headers.trim().to_string();
     }
+    mgr.remember_add_queue(&req.queue);
     mgr.inner().add(items, req.start);
     let _ = window.close();
     Ok(())
@@ -1011,12 +1273,12 @@ async fn torrent_recheck(mgr: M<'_>, ids: Vec<String>) -> R<()> {
     // One torrent that can't be checked must not leave the others in the selection unchecked.
     let mut failed: Vec<String> = vec![];
     for id in ids {
+        let _guard = m.torrents.operation(&id).lock_owned().await;
+        if m.exiting.load(Ordering::Relaxed) { break; }
         let Some(it) = m.item(&id) else { continue };
-        if it.status == DlStatus::Verifying {
-            continue;
-        }
+        m.torrents.begin_check(&id);
         let resume = m.is_running(&id) || matches!(it.status, DlStatus::Queued | DlStatus::Completed);
-        m.pause(&id).await;
+        m.pause_inner(&id).await;
         m.with_item(&id, |it| {
             it.set_status(DlStatus::Verifying);
             it.verify_progress = 0.0;
@@ -1035,7 +1297,7 @@ async fn torrent_recheck(mgr: M<'_>, ids: Vec<String>) -> R<()> {
                     }
                 });
                 if !done && resume {
-                    m.start(&id);
+                    m.start_inner(&id, None);
                 }
             }
             Err(e) => {
@@ -1051,20 +1313,20 @@ async fn torrent_recheck(mgr: M<'_>, ids: Vec<String>) -> R<()> {
     if failed.is_empty() { Ok(()) } else { Err(failed.join("\n")) }
 }
 
-/// Asks trackers and DHT for peers again: re-adding a running torrent makes librqbit announce afresh.
+/// Asks trackers and peer discovery for peers without touching downloaded data.
 #[tauri::command]
 async fn torrent_reannounce(mgr: M<'_>, ids: Vec<String>) -> R<usize> {
-    let m = mgr.inner().clone();
     let mut n = 0;
     for id in ids {
-        if !m.is_running(&id) || !m.with_item(&id, |i| i.is_torrent).unwrap_or(false) {
-            continue;
-        }
-        m.pause(&id).await;
-        if let Some(it) = m.item(&id) {
-            m.torrents.remove(&m, &it, false).await;
-        }
-        m.start(&id);
+        let Some(it) = mgr.item(&id).filter(|it| it.is_torrent) else { continue };
+        let h = mgr.torrents.find(&it.info_hash).ok_or("Start it first")?;
+        h.force_announce().map_err(|e| e.to_string())?;
+        let next = librqbit::tracker_status::get(&it.info_hash.to_lowercase()).values()
+            .filter_map(|s| s.next_announce).map(|t| t.saturating_duration_since(std::time::Instant::now()).as_secs()).min();
+        mgr.with_item(&id, |it| it.note = match next {
+            Some(seconds) => format!("asked trackers; next automatic announce in {seconds} s"),
+            None => "asked trackers and peer discovery".into(),
+        });
         n += 1;
     }
     Ok(n)
@@ -1074,6 +1336,8 @@ async fn torrent_reannounce(mgr: M<'_>, ids: Vec<String>) -> R<usize> {
 async fn torrent_move(mgr: M<'_>, ids: Vec<String>, folder: String, restart_if_unfinished: Option<bool>) -> R<()> {
     let m = mgr.inner().clone();
     for id in ids {
+        let _guard = m.torrents.operation(&id).lock_owned().await;
+        if m.exiting.load(Ordering::Relaxed) { break; }
         let Some(it) = m.item(&id) else { continue };
         if it.save_folder.trim_end_matches('\\').eq_ignore_ascii_case(folder.trim_end_matches('\\')) {
             continue;
@@ -1086,7 +1350,7 @@ async fn torrent_move(mgr: M<'_>, ids: Vec<String>, folder: String, restart_if_u
         }
         let resume = m.is_running(&id);
         torrent::check_move_destination(&it, &folder).map_err(|e| e.msg)?;
-        m.pause(&id).await;
+        m.pause_inner(&id).await;
         m.with_item(&id, |it| it.note = if fresh { "clearing old partial files…".into() } else { "moving files…".into() });
         let r = if fresh {
             m.torrents.remove(&m, &it, true).await;
@@ -1098,6 +1362,7 @@ async fn torrent_move(mgr: M<'_>, ids: Vec<String>, folder: String, restart_if_u
             it.note.clear();
             if r.is_ok() {
                 it.save_folder = folder.clone();
+                it.incomplete_folder.clear();
                 if fresh {
                     it.downloaded = 0;
                     it.verify_progress = 0.0;
@@ -1105,7 +1370,7 @@ async fn torrent_move(mgr: M<'_>, ids: Vec<String>, folder: String, restart_if_u
             }
         });
         if resume {
-            m.start(&id);
+            m.start_inner(&id, None);
         }
         m.save();
         r.map_err(|e| format!("Couldn't move “{}”: {}", it.file_name, e.msg))?;
@@ -1136,7 +1401,9 @@ async fn torrent_add_trackers(mgr: M<'_>, ids: Vec<String>, text: String) -> R<u
         if m.is_running(id) {
             m.pause(id).await;
             if let Some(it) = m.item(id) {
-                m.torrents.remove(&m, &it, false).await;
+                if let (Some(session), Some(h)) = (m.torrents.session_now(), m.torrents.find(&it.info_hash)) {
+                    session.detach_for_move(&h).await.map_err(|e| e.to_string())?;
+                }
             }
             m.start(id);
         }
@@ -1208,6 +1475,21 @@ fn icon_choose(mgr: M, ids: Vec<String>, path: String) -> R<()> {
 }
 
 #[tauri::command]
+fn banner_choose(mgr: M, ids: Vec<String>, path: String) -> R<()> {
+    for id in ids {
+        covers::use_banner(mgr.inner(), &id, &path).map_err(|e| format!("Couldn't use that picture: {e}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn banner_reset(mgr: M, ids: Vec<String>) {
+    for id in ids {
+        covers::reset_banner(mgr.inner(), &id);
+    }
+}
+
+#[tauri::command]
 fn icon_mode(mgr: M, ids: Vec<String>, mode: String) {
     for id in ids {
         covers::set_mode(mgr.inner(), &id, &mode);
@@ -1253,22 +1535,21 @@ fn queue_save(mgr: M, old_name: String, def: Value) -> R<()> {
             return Err("Times must look like 02:00 or 23:30.".into());
         }
     }
+    let mut parsed: QueueDef = serde_json::from_value(def.clone()).map_err(|e| e.to_string())?;
     if name != old_name {
         if mgr.st.lock().queues.iter().any(|q| q.name.eq_ignore_ascii_case(&name) && q.name != old_name) {
             return Err("Another queue already has that name.".into());
         }
-        mgr.rename_queue(&old_name, &name);
+        mgr.rename_queue(&old_name, &name)?;
     }
-    let mut parsed: QueueDef = serde_json::from_value(def).map_err(|e| e.to_string())?;
     {
         let mut st = mgr.st.lock();
         let Some(q) = st.queues.iter_mut().find(|q| q.name == name) else { return Err("That queue no longer exists.".into()) };
         parsed.name = name.clone();
-        parsed.running = q.running;
-        parsed.started_ids = q.started_ids.clone();
-        parsed.last_start_fire = q.last_start_fire;
-        parsed.last_stop_fire = q.last_stop_fire;
+        manager::preserve_queue_runtime(&mut parsed, q, chrono::Local::now().naive_local());
         parsed.max_concurrent = parsed.max_concurrent.clamp(1, 20);
+        parsed.retry_count = parsed.retry_count.clamp(0, 100);
+        parsed.retry_delay_sec = parsed.retry_delay_sec.clamp(1, 86400);
         parsed.speed_limit_kbps = parsed.speed_limit_kbps.max(0);
         *q = parsed;
     }
@@ -1315,29 +1596,53 @@ fn queue_run(mgr: M, name: String, on: bool) {
     mgr.push_list();
 }
 
+// Insertion moves preserve the relative order of every other queue member.
+fn reorder_queue_members(list: &mut Vec<String>, id: &str, dir: i32) {
+    let Some(from) = list.iter().position(|x| x == id) else { return };
+    let to = (from as i64 + i64::from(dir)).clamp(0, list.len() as i64 - 1) as usize;
+    let member = list.remove(from);
+    list.insert(to, member);
+}
+
 #[tauri::command]
 fn queue_move(mgr: M, name: String, id: String, dir: i32) {
     {
         let mut st = mgr.st.lock();
-        let list = Manager::queue_members(&st, &name);
-        let Some(i) = list.iter().position(|x| *x == id) else { return };
-        let j = i as i32 + dir;
-        if j < 0 || j >= list.len() as i32 {
-            return;
-        }
-        let (a, b) = (list[i].clone(), list[j as usize].clone());
-        let oa = st.items.iter().find(|x| x.id == a).map(|x| x.queue_order).unwrap_or(0);
-        let ob = st.items.iter().find(|x| x.id == b).map(|x| x.queue_order).unwrap_or(0);
-        let (na, nb) = if oa == ob { if dir > 0 { (ob, oa - 1) } else { (ob - 1, oa) } } else { (ob, oa) };
-        for it in st.items.iter_mut() {
-            if it.id == a {
-                it.queue_order = na;
-            } else if it.id == b {
-                it.queue_order = nb;
+        let mut list = Manager::queue_members(&st, &name);
+        if !list.contains(&id) { return; }
+        reorder_queue_members(&mut list, &id, dir);
+        for it in st.items.iter_mut().filter(|it| it.queue_name == name) {
+            if let Some(order) = list.iter().position(|id| id == &it.id) {
+                it.queue_order = order as i64;
             }
         }
     }
     mgr.mark_dirty();
+}
+
+#[cfg(test)]
+mod queue_order_tests {
+    use super::reorder_queue_members;
+
+    #[test]
+    fn insertion_moves_preserve_other_members_and_handle_edges() {
+        let mut list: Vec<String> = ["a", "b", "c", "d"].into_iter().map(String::from).collect();
+        reorder_queue_members(&mut list, "d", -3);
+        assert_eq!(list, ["d", "a", "b", "c"]);
+        reorder_queue_members(&mut list, "a", 2);
+        assert_eq!(list, ["d", "b", "c", "a"]);
+        reorder_queue_members(&mut list, "c", -1);
+        assert_eq!(list, ["d", "c", "b", "a"]);
+        reorder_queue_members(&mut list, "c", 1);
+        assert_eq!(list, ["d", "b", "c", "a"]);
+        reorder_queue_members(&mut list, "a", i32::MIN);
+        assert_eq!(list, ["a", "d", "b", "c"]);
+        reorder_queue_members(&mut list, "a", i32::MAX);
+        assert_eq!(list, ["d", "b", "c", "a"]);
+        reorder_queue_members(&mut list, "missing", 1);
+        assert_eq!(list, ["d", "b", "c", "a"]);
+        reorder_queue_members(&mut vec![], "missing", 1);
+    }
 }
 
 // ------------------------------------------------------------------ commands: settings & stats
@@ -1356,6 +1661,7 @@ fn get_settings(mgr: M) -> Value {
 #[tauri::command]
 async fn save_settings(app: AppHandle, mgr: M<'_>, settings: Settings) -> R<()> {
     let mut new = settings;
+    new.normalize_appearance();
     // Unknown fields are kept for the .NET version (all PascalCase); anything else is a stray UI key.
     new.extra.retain(|k, _| k.starts_with(|c: char| c.is_ascii_uppercase()));
     std::fs::create_dir_all(&new.default_folder).map_err(|_| "The default save folder can't be created.".to_string())?;
@@ -1365,6 +1671,33 @@ async fn save_settings(app: AppHandle, mgr: M<'_>, settings: Settings) -> R<()> 
     if new.remote_enabled && (new.remote_pin.len() < 4 || !new.remote_pin.chars().all(|c| c.is_ascii_digit())) {
         return Err("The phone remote PIN must be at least 4 digits.".into());
     }
+    torrent::tracker_lines(&new.torrent_always_trackers)?;
+    torrent::blocklist_source(&new.torrent_blocklist_url)?;
+    new.torrent_watch_folder = new.torrent_watch_folder.trim().to_string();
+    if !new.torrent_watch_folder.is_empty() && !std::path::Path::new(&new.torrent_watch_folder).is_absolute() {
+        return Err("The watched folder must be an absolute path.".into());
+    }
+    new.torrent_seed_minutes = new.torrent_seed_minutes.max(0);
+    if !matches!(new.torrent_seed_action.as_str(), "Stop" | "Remove") { return Err("Choose Stop sharing or Remove torrent.".into()); }
+    if !ICON_THEMES.iter().any(|(name, _)| *name == new.icon_theme) { new.icon_theme = "heat".into(); }
+    new.art_strength = new.art_strength.clamp(25, 500);
+    new.art_blur = if new.art_blur < 0 { -1 } else { new.art_blur.min(80) };
+    new.card_art_strength = new.card_art_strength.clamp(25, 400);
+    new.card_art_blur = new.card_art_blur.clamp(0, 40);
+    new.banner_strength = new.banner_strength.clamp(25, 150);
+    new.banner_blur = new.banner_blur.clamp(0, 40);
+    if !matches!(new.video_subtitles.as_str(), "None" | "Download" | "Embed") { new.video_subtitles = "None".into(); }
+    if !matches!(new.video_sponsorblock.as_str(), "Off" | "Mark" | "Remove") { new.video_sponsorblock = "Off".into(); }
+    new.video_sub_langs = new.video_sub_langs.split(',').map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(",");
+    if new.video_sub_langs.is_empty() { new.video_sub_langs = "en.*".into(); }
+    new.video_cookies_file = new.video_cookies_file.trim().trim_matches('"').to_string();
+    if !new.video_cookies_file.is_empty() && !std::path::Path::new(&new.video_cookies_file).is_file() { return Err("The cookies.txt file wasn't found. Pick the file again or clear the field.".into()); }
+    new.video_custom_format = new.video_custom_format.trim().to_string();
+    if new.default_video_format == "custom" && new.video_custom_format.is_empty() { return Err("Enter a custom format (a yt-dlp -f selector) or pick another default quality.".into()); }
+    new.discord_webhook = new.discord_webhook.trim().to_string();
+    if !new.discord_webhook.is_empty() && !notify::valid_webhook(&new.discord_webhook) { return Err("That isn't a Discord webhook link. In Discord: channel settings → Integrations → Webhooks → Copy Webhook URL.".into()); }
+    new.discord_disk_gb = new.discord_disk_gb.clamp(1, 100_000);
+    if new.discord_daily && parse_hhmm(&new.discord_daily_time).is_none() { return Err("Enter the daily summary time as HH:MM (24-hour), e.g. 23:00.".into()); }
     new.torrent_seed_ratio = new.torrent_seed_ratio.clamp(0.0, 100.0);
     new.torrent_port = if new.torrent_port == 0 { 0 } else { new.torrent_port.clamp(1024, 65535) };
     new.remote_port = new.remote_port.clamp(1024, 65535);
@@ -1373,6 +1706,7 @@ async fn save_settings(app: AppHandle, mgr: M<'_>, settings: Settings) -> R<()> 
     new.max_retries = new.max_retries.clamp(0, 1000);
     new.read_timeout_sec = new.read_timeout_sec.clamp(5, 600);
     new.queue_retries = new.queue_retries.clamp(0, 100);
+    new.max_manual_downloads = new.max_manual_downloads.clamp(1, 100);
     new.global_speed_limit_kbps = new.global_speed_limit_kbps.max(0);
 
     let m = mgr.inner().clone();
@@ -1383,6 +1717,15 @@ async fn save_settings(app: AppHandle, mgr: M<'_>, settings: Settings) -> R<()> 
     new.columns_layout_version = old.columns_layout_version;
     new.sidebar_width = old.sidebar_width;
     new.details_height = old.details_height;
+    new.startup_asked_at = old.startup_asked_at;
+    new.last_add_queue = old.last_add_queue.clone();
+    if old.start_with_windows && !new.start_with_windows {
+        new.startup_asked_at = Some(chrono::Local::now()); // just turned off on purpose: don't ask for two weeks
+    }
+    if !matches!(new.existing_file_policy.as_str(), "Ask" | "Number" | "Overwrite" | "Skip") { return Err("Choose a valid existing-file action".into()); }
+    if !new.incomplete_folder.is_empty() && !std::path::Path::new(&new.incomplete_folder).is_absolute() { return Err("The unfinished folder must be an absolute path".into()); }
+    new.schedule_days_mask &= 127;
+    net::configure_proxy(&new)?;
     m.st.lock().settings = new.clone();
     m.save();
 
@@ -1399,17 +1742,53 @@ async fn save_settings(app: AppHandle, mgr: M<'_>, settings: Settings) -> R<()> 
         covers::refresh_all(&m);
     }
     apply_window_theme(&app, &new.theme);
+    if old.icon_theme != new.icon_theme {
+        apply_app_icon(&app);
+    }
     let _ = app.emit("theme-changed", &new.theme);
+    let _ = app.emit("appearance-changed", &new);
     let _ = app.emit("settings-changed", json!({}));
     m.push_list();
     Ok(())
 }
 
 /// The window's column layout / panel sizes (saved with the settings).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadLayout {
+    list_width: Option<f64>,
+    rail_width: Option<f64>,
+    sort_key: Option<String>,
+    sort_direction: Option<i32>,
+    group_by: Option<String>,
+    table_view: Option<bool>,
+}
+
 #[tauri::command]
-fn save_layout(mgr: M, columns: std::collections::HashMap<String, ColumnState>, sidebar: f64, details: f64, split: Option<f64>) {
+fn save_layout(mgr: M, columns: std::collections::HashMap<String, ColumnState>, sidebar: f64, details: f64, split: Option<f64>, layout: Option<DownloadLayout>) {
     {
         let mut st = mgr.st.lock();
+        if let Some(layout) = layout {
+            if let Some(width) = layout.rail_width.filter(|w| w.is_finite()) {
+                st.settings.extra.insert("RailWidth".into(), json!(width.clamp(62.0, 240.0)));
+            }
+            if let Some(width) = layout.list_width.filter(|w| w.is_finite()) {
+                st.settings.extra.insert("DownloadListWidth".into(), json!(width.clamp(260.0, 600.0)));
+            }
+            if let Some(key) = layout.sort_key {
+                st.settings.extra.insert("DownloadSortKey".into(), json!(key));
+            }
+            if let Some(direction) = layout.sort_direction {
+                st.settings.extra.insert("DownloadSortDirection".into(), json!(if direction == 1 { 1 } else { -1 }));
+            }
+            if let Some(group) = layout.group_by {
+                let group = if ["None", "Date added", "Status", "Type/category", "Site", "Queue"].contains(&group.as_str()) { group } else { "None".into() };
+                st.settings.extra.insert("DownloadGroupBy".into(), json!(group));
+            }
+            if let Some(table) = layout.table_view {
+                st.settings.extra.insert("DownloadTableView".into(), json!(table));
+            }
+        }
         st.settings.columns = columns;
         st.settings.columns_layout_version = 3;
         st.settings.sidebar_width = sidebar;
@@ -1687,11 +2066,12 @@ fn main() {
     }
     builder
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_decorum::init())
         .register_asynchronous_uri_scheme_protocol("img", move |_ctx, req, responder| {
             let mgr = img_mgr.clone();
             std::thread::spawn(move || {
                 let resp = match covers::serve(&mgr, req.uri().path()) {
-                    Some((b, mime)) => tauri::http::Response::builder().header("Content-Type", mime).header("Cache-Control", "max-age=86400").body(b),
+                    Some((b, mime)) => tauri::http::Response::builder().header("Content-Type", mime).header("Access-Control-Allow-Origin", "*").header("Cache-Control", "max-age=86400").body(b),
                     None => tauri::http::Response::builder().status(404).body(Vec::new()),
                 };
                 if let Ok(r) = resp {
@@ -1709,6 +2089,11 @@ fn main() {
             }
             mgr.load(updated);
             apply_window_theme(&handle, &mgr.settings().theme);
+            // The page draws its own title bar (Windows 11 style); the plugin keeps native snap layouts, resize edges and shadow.
+            if let Some(w) = handle.get_webview_window("main") {
+                use tauri_plugin_decorum::WebviewWindowExt;
+                let _ = w.create_overlay_titlebar();
+            }
             {
                 let h = handle.clone();
                 mgr.set_ui(Box::new(move |event, payload| match event {
@@ -1748,7 +2133,7 @@ fn main() {
                 ],
             )?;
             TrayIconBuilder::with_id("main")
-                .icon(tapp.default_window_icon().cloned().expect("icon"))
+                .icon(app_icon(&handle).or_else(|| tapp.default_window_icon().cloned()).expect("icon"))
                 .tooltip("FluxDM")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -1777,6 +2162,7 @@ fn main() {
                     }
                 })
                 .build(tapp)?;
+            apply_app_icon(&handle);
 
             // Closing the main window keeps FluxDM in the tray (or exits, per settings).
             if let Some(w) = handle.get_webview_window("main") {
@@ -1845,10 +2231,10 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            init, ready, start, pause, toggle, pause_all, remove, restart, clear_finished, set_items, add_mirrors, probe, refresh_link,
-            details, open_item, show_item, copy_text, clipboard_url, sha256, set_global_limit, parse_speed, free_space, run_post_action,
-            exit, toast_click, toast_hide, toast_ready, toast_show, open_add, dropped_torrent, add_init, add_take_links, classify, folder_for, video_probe, torrent_info, add_submit,
-            webview_guard::ui_heartbeat, torrent_recheck, torrent_reannounce, torrent_move, torrent_add_trackers, torrent_copy, torrent_export, torrent_file, torrent_file_priority, icon_find, icon_choose,
+            init, ready, startup_prompt_due, startup_prompt_answer, start, pause, toggle, pause_all, remove, restart, clear_finished, set_items, add_mirrors, probe, refresh_link,
+            details, open_item, show_item, copy_text, clipboard_url, sha256, set_global_limit, set_global_upload_limit, parse_speed, free_space, run_post_action,
+            exit, toast_click, toast_hide, toast_ready, toast_show, countdown_choice, countdown_toast, add_art, toast_item, open_add, dropped_torrent, add_init, remember_add_queue, add_take_links, classify, folder_for, video_probe, discord_test, torrent_info, add_submit,
+            webview_guard::ui_heartbeat, torrent_recheck, torrent_reannounce, torrent_move, torrent_add_trackers, torrent_copy, torrent_export, torrent_file, torrent_file_priority, icon_find, icon_choose, banner_choose, banner_reset,
             icon_mode, clean_title, queues, queue_save, queue_new, queue_delete, queue_run, queue_move, get_settings, save_settings,
             save_layout, new_pin, stats, reset_stats, yt_version, yt_update, firewall_status, firewall_allow, magnet_toggle,
             open_extension_folder, extension_info, install_extension, open_data_folder, pair_phone, bookmarklets, check_update, install_update

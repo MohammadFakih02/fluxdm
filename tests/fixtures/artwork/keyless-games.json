@@ -1,0 +1,63 @@
+{
+  "search": {
+    "Results": [
+      {
+        "Products": [
+          {
+            "ProductId": "wrong",
+            "Title": "Bloodborne II",
+            "Type": "Game"
+          },
+          {
+            "ProductId": "game-id",
+            "Title": "Bloodborne",
+            "Type": "Game"
+          },
+          {
+            "Title": "Spotify",
+            "Type": "Application",
+            "ProductId": "app-id"
+          }
+        ]
+      }
+    ]
+  },
+  "details": {
+    "Products": [
+      {
+        "LocalizedProperties": [
+          {
+            "Images": [
+              {
+                "ImagePurpose": "BoxArt",
+                "Uri": "//example.invalid/box.jpg"
+              },
+              {
+                "ImagePurpose": "SuperHeroArt",
+                "Uri": "//example.invalid/hero.jpg"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "results": [
+    {
+      "name": "Bloodborne (TM)",
+      "platform": "ps4",
+      "title_id": "CUSA00207"
+    },
+    {
+      "name": "God of War III Remastered (R)",
+      "platform": "ps4",
+      "title_id": "CUSA01623"
+    }
+  ],
+  "products": [
+    {
+      "title": "Bloodborne",
+      "coverHorizontal": "https://example.invalid/gog.jpg"
+    }
+  ]
+}

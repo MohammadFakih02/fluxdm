@@ -146,10 +146,31 @@ impl OpenedFile {
         }
     }
 
+    // FluxDM patch: routing changes hold the storage lock while replacing handles.
+    pub fn replace(&self, other: Self) {
+        *self.file.write() = std::mem::take(&mut *other.file.write());
+    }
+
     pub fn new_dummy() -> Self {
         Self {
             file: RwLock::new(Default::default()),
         }
+    }
+
+    /// FluxDM patch: publish a completed marker without replacing an existing file.
+    pub fn publish(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let mut g = self.file.write();
+        if g.fd.is_none() || g.path == path { return Ok(()); }
+        anyhow::ensure!(!path.try_exists()?, "finished filename already exists");
+        if let Some(f) = g.fd.as_ref() { f.sync_data()?; }
+        drop(g.fd.take());
+        if let Err(e) = super::sparse::rename_new(&g.path, path) {
+            g.fd = Some(std::fs::OpenOptions::new().read(true).write(true).open(&g.path)?);
+            return Err(e.into());
+        }
+        g.path = path.to_path_buf();
+        g.fd = Some(std::fs::File::open(path)?);
+        Ok(())
     }
 
     /// FluxDM patch: swap the read/write handle for a read-only one (same path).

@@ -53,7 +53,18 @@ pub trait StorageFactory: Send + Sync + Any {
         shared: &ManagedTorrentShared,
         metadata: &TorrentMetadata,
     ) -> anyhow::Result<Self::Storage> {
+        self.create_and_init_selected(shared, metadata, None)
+    }
+
+    // FluxDM patch: selection must be known before filesystem initialization.
+    fn create_and_init_selected(
+        &self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+        only_files: Option<&[usize]>,
+    ) -> anyhow::Result<Self::Storage> {
         let mut storage = self.create(shared, metadata)?;
+        storage.set_file_selection(only_files)?;
         storage.init(shared, metadata)?;
         Ok(storage)
     }
@@ -118,6 +129,13 @@ impl<U: StorageFactory + ?Sized> StorageFactory for Box<U> {
 }
 
 pub trait TorrentStorage: Send + Sync {
+    // FluxDM patch: configure routing before initialization or publishing a selection.
+    fn set_file_selection(&self, _only_files: Option<&[usize]>) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn remove_partfile(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     // Create/open files etc.
     fn init(
         &mut self,
@@ -177,6 +195,12 @@ pub trait TorrentStorage: Send + Sync {
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
+    fn set_file_selection(&self, only_files: Option<&[usize]>) -> anyhow::Result<()> {
+        (**self).set_file_selection(only_files)
+    }
+    fn remove_partfile(&self) -> anyhow::Result<()> {
+        (**self).remove_partfile()
+    }
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         (**self).pread_exact(file_id, offset, buf)
     }

@@ -18,11 +18,15 @@ pub type BoxBitV = Box<dyn BitV>;
 
 struct DiskFlushRequest {
     snapshot: BitBox<u8, Msb0>,
+    generation: u64,
 }
 
 pub struct DiskBackedBitV {
     bv: BitBox<u8, Msb0>,
     flush_tx: tokio::sync::mpsc::UnboundedSender<DiskFlushRequest>,
+    // FluxDM patch: serialize durable flushes with queued writes, ignoring older snapshots.
+    file: std::sync::Arc<parking_lot::Mutex<(std::fs::File, u64)>>,
+    generation: u64,
 }
 
 impl Drop for DiskBackedBitV {
@@ -31,6 +35,7 @@ impl Drop for DiskBackedBitV {
             .flush_tx
             .send(DiskFlushRequest {
                 snapshot: self.bv.clone(),
+                generation: self.generation + 1,
             })
             .is_err()
         {
@@ -61,6 +66,8 @@ impl DiskBackedBitV {
             .await
             .with_context(|| format!("error opening {filename:?}"))?;
 
+        let file = std::sync::Arc::new(parking_lot::Mutex::new((file, 0)));
+        let background_file = file.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DiskFlushRequest>();
         librqbit_core::spawn_utils::spawn(
             debug_span!("diskbitv-flusher", ?filename),
@@ -76,7 +83,12 @@ impl DiskBackedBitV {
 
                     if let Err(e) = spawner
                         .block_in_place_with_semaphore(|| {
-                            file.pwrite_all(0, req.snapshot.as_raw_slice())
+                            let mut g = background_file.lock();
+                            if req.generation <= g.1 { return Ok(()); }
+                            g.0.pwrite_all(0, req.snapshot.as_raw_slice())?;
+                            g.0.sync_all()?;
+                            g.1 = req.generation;
+                            Ok::<_, anyhow::Error>(())
                         })
                         .await
                     {
@@ -86,19 +98,12 @@ impl DiskBackedBitV {
                         }
                         break;
                     }
-
-                    if let Err(e) = spawner
-                        .block_in_place_with_semaphore(|| file.sync_all())
-                        .await
-                    {
-                        tracing::error!(?filename, "error fsyncing bitv: {e:#}");
-                    }
                 }
 
                 Ok::<_, anyhow::Error>(())
             },
         );
-        Ok(Self { bv, flush_tx: tx })
+        Ok(Self { bv, flush_tx: tx, file, generation: 0 })
     }
 }
 
@@ -138,9 +143,18 @@ impl BitV for DiskBackedBitV {
         self.bv.as_raw_slice()
     }
 
-    fn flush(&mut self, _flush_async: bool) -> anyhow::Result<()> {
+    fn flush(&mut self, flush_async: bool) -> anyhow::Result<()> {
+        self.generation += 1;
+        if !flush_async {
+            // FluxDM patch: pause/completion must be durable before returning.
+            let mut g = self.file.lock();
+            g.0.pwrite_all(0, self.bv.as_raw_slice())?;
+            g.0.sync_all()?;
+            g.1 = self.generation;
+            return Ok(());
+        }
         let req = DiskFlushRequest {
-            snapshot: self.bv.clone(),
+            snapshot: self.bv.clone(), generation: self.generation,
         };
         self.flush_tx.send(req).context("flusher task is dead")
     }

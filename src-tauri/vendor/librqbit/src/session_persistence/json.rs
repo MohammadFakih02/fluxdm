@@ -177,7 +177,12 @@ impl JsonSessionPersistenceStore {
             }
         }
 
-        self.db_content.write().await.torrents.insert(id, st);
+        // FluxDM patch: deferred restoration may assign a new ID to the same hash.
+        {
+            let mut db = self.db_content.write().await;
+            db.torrents.retain(|_, old| old.info_hash() != st.info_hash());
+            db.torrents.insert(id, st);
+        }
         self.flush().await?;
 
         Ok(())
@@ -228,6 +233,9 @@ impl BitVFactory for JsonSessionPersistenceStore {
         tokio::io::copy(&mut b.as_raw_slice(), &mut dst)
             .await
             .context("error writing bitslice to {filename:?}")?;
+        // FluxDM patch: initial/recheck results must survive an immediate exit.
+        dst.sync_all().await?;
+        drop(dst);
         tokio::fs::rename(&tmp_filename, &filename)
             .await
             .with_context(|| format!("error renaming {tmp_filename:?} to {filename:?}"))?;

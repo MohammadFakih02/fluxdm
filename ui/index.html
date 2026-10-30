@@ -7,43 +7,48 @@
 <link rel="stylesheet" href="main.css">
 </head>
 <body>
-<div id="app">
-  <header id="toolbar">
-    <div class="tb-group">
-      <button id="btnAdd" class="primary" title="Add one or many links (Ctrl+N)" aria-label="Add URL"><span data-icon="add"></span><span class="tb-label">Add URL</span></button>
-      <button id="btnResume" class="ghost" title="Start / resume selected (Space)" aria-label="Resume"><span data-icon="play"></span><span class="tb-label">Resume</span></button>
-      <button id="btnPause" class="ghost" title="Pause selected (Space)" aria-label="Pause"><span data-icon="pause"></span><span class="tb-label">Pause</span></button>
-      <button id="btnPauseAll" class="ghost" title="Pause everything and stop all queues" aria-label="Pause all"><span data-icon="pauseAll"></span><span class="tb-label">Pause all</span></button>
-      <button id="btnDelete" class="ghost" title="Remove selected (Del)" aria-label="Delete"><span data-icon="trash"></span><span class="tb-label">Delete</span></button>
-      <button id="btnClear" class="ghost" title="Remove all finished downloads from the list (files are kept)" aria-label="Clear finished"><span data-icon="broom"></span><span class="tb-label">Clear finished</span></button>
-      <span class="tb-sep"></span>
-      <button id="btnScheduler" class="ghost tb-2" title="Queues and scheduler" aria-label="Scheduler"><span data-icon="clock"></span><span class="tb-label">Scheduler</span></button>
-      <button id="btnStats" class="ghost tb-2" title="How much you downloaded per day and month" aria-label="Stats"><span data-icon="chart"></span><span class="tb-label">Stats</span></button>
-      <button id="btnColumns" class="ghost tb-2" title="Choose which columns the list shows" aria-label="Columns"><span data-icon="columns"></span><span class="tb-label">Columns</span></button>
-      <button id="btnSettings" class="ghost tb-2" title="Settings" aria-label="Settings"><span data-icon="gear"></span><span class="tb-label">Settings</span></button>
-      <button id="btnMore" class="ghost" title="More actions" aria-label="More actions" aria-haspopup="menu" hidden>&#8943;</button>
-    </div>
-    <div id="updateBadge" hidden><button id="btnUpdate" class="small primary">Update available</button></div>
+<div id="windowArt" aria-hidden="true"></div><div id="app">
+  <div id="titlebar" data-tauri-decorum-tb>
+    <div class="tb-brand" data-tauri-drag-region><img class="app-logo" src="icon.png" alt="" data-tauri-drag-region><span data-tauri-drag-region>FluxDM</span></div>
+    <div class="tb-center" data-tauri-drag-region>
     <div id="search" title="Filter by name or URL (Ctrl+F)">
-      <button id="searchToggle" class="ghost" title="Search (Ctrl+F)" aria-label="Search" aria-expanded="false" aria-controls="searchBox"><span data-icon="search"></span></button>
-      <input id="searchBox" type="text" aria-label="Filter downloads" placeholder="Search" spellcheck="false">
+        <button id="searchToggle" class="ghost" title="Search (Ctrl+F)" aria-label="Search" aria-expanded="false" aria-controls="searchBox"><span data-icon="search"></span></button>
+        <input id="searchBox" type="text" aria-label="Filter downloads" placeholder="Search" spellcheck="false">
+      </div>
     </div>
-  </header>
-
+  </div>
   <div id="main">
-    <nav id="sidebar">
+    <nav id="sidebar" aria-label="Download navigation"><button id="btnAdd" class="primary" title="Add one or many links (Ctrl+N)" aria-label="Add URL"><span data-icon="add"></span><span class="tb-label">Add URL</span></button>
       <div id="nav"></div>
-      <div id="queuePanel" class="card" hidden>
+<div id="railTools">      <button id="btnScheduler" class="ghost tb-2" title="Queues and scheduler" aria-label="Scheduler"><span data-icon="clock"></span><span class="tb-label">Scheduler</span></button><button id="btnQueues" class="ghost" title="Queues and filters" aria-label="Queues and filters"><span data-icon="queue"></span><span class="tb-label">Queues</span></button>      <button id="btnStats" class="ghost tb-2" title="How much you downloaded per day and month" aria-label="Stats"><span data-icon="chart"></span><span class="tb-label">Stats</span></button>      <button id="btnSettings" class="ghost tb-2" title="Settings" aria-label="Settings"><span data-icon="gear"></span><span class="tb-label">Settings</span></button></div><div id="queuePanel" class="card" hidden>
         <div id="queueInfo"></div>
         <div class="row" style="margin-top:10px">
           <button id="queueStart" class="grow">Start queue</button>
           <button id="queueStop" class="grow">Stop</button>
         </div>
       </div>
-    </nav>
-    <div class="split-v" id="splitSidebar"></div>
+    <div id="railResize" role="separator" aria-label="Resize navigation" aria-orientation="vertical" tabindex="0"></div></nav>
 
-    <section id="content">
+
+<section id="content"><div id="downloadColumn">  <header id="toolbar">
+    <div class="tb-group">
+
+      <button id="btnResume" class="ghost" title="Start / resume selected (Space)" aria-label="Resume"><span data-icon="play"></span><span class="tb-label">Resume</span></button>
+      <button id="btnPause" class="ghost" title="Pause selected (Space)" aria-label="Pause"><span data-icon="pause"></span><span class="tb-label">Pause</span></button>
+      <button id="btnPauseAll" class="ghost" title="Pause everything and stop all queues" aria-label="Pause all"><span data-icon="pauseAll"></span><span class="tb-label">Pause all</span></button>
+      <button id="btnDelete" class="ghost" title="Remove selected (Del)" aria-label="Delete"><span data-icon="trash"></span><span class="tb-label">Delete</span></button>
+      <button id="btnClear" class="ghost" title="Remove all finished downloads from the list (files are kept)" aria-label="Clear finished"><span data-icon="broom"></span><span class="tb-label">Clear finished</span></button>
+      <span class="tb-sep"></span>
+
+
+      <button id="btnColumns" class="ghost tb-2" title="Choose which columns the list shows" aria-label="Columns"><span data-icon="columns"></span><span class="tb-label">Columns</span></button>
+
+      <button id="btnMore" class="ghost" title="More actions" aria-label="More actions" aria-haspopup="menu" hidden><span data-icon="other"></span></button>
+    </div>
+    <div id="updateBadge" hidden><button id="btnUpdate" class="small primary">Update available</button></div>
+  </header>
+
+<div id="sortBar"><label for="sortSelect">Sort</label><select id="sortSelect" aria-label="Sort downloads"></select><button id="sortDirection" class="ghost" title="Toggle sort direction" aria-label="Toggle sort direction"></button><span class="group-control"><label for="groupSelect">Group</label><select id="groupSelect" aria-label="Group downloads"></select></span><span id="listCount"></span></div>
       <div id="listWrap">
         <table id="list">
           <thead><tr id="head"></tr></thead>
@@ -56,34 +61,43 @@
           <button id="emptyAction" class="primary"></button>
         </div>
       </div>
-      <div class="split-h" id="splitDetails"></div>
+      </div><div class="split-v" id="splitSidebar"></div>
       <div id="details">
         <div id="detailsEmpty">Select a download to see its connections, speed graph and options.<br>Tip: drag links or a .txt of links onto this window, or copy a link — FluxDM catches it.</div>
         <div id="detailsPane" hidden>
-          <div id="tabs">
-            <button class="tab active" data-tab="general">General</button>
-            <button class="tab" data-tab="trackers" data-torrent>Trackers</button>
-            <button class="tab" data-tab="peers" data-torrent>Peers</button>
-            <button class="tab" data-tab="content" data-torrent>Content</button>
-          </div>
-          <div class="tabpage" id="tab-general">
-            <div id="genLeft">
-              <div class="gen-head">
-                <img id="dCover" alt="" hidden>
-                <div class="grow">
-                  <div id="dName" class="ell selectable"></div>
-                  <input id="dUrl" type="text" readonly spellcheck="false">
-                </div>
-              </div>
-              <div class="kv">
-                <span>Saved to</span><span id="dPath" class="selectable"></span>
+          <header id="detailBanner">
+            <div id="bannerArt" aria-hidden="true"></div><div class="banner-shade" aria-hidden="true"></div>
+            <div class="reveal-grey" aria-hidden="true"></div><div class="reveal-tint" aria-hidden="true"></div>
+            <div class="reveal-line" aria-hidden="true"></div><div class="reveal-bar" aria-hidden="true"><i></i></div>
+            <div class="banner-content"><div id="detailIcon"><img id="dCover" alt="" hidden><span id="detailGlyph"></span></div>
+              <div class="banner-title"><div id="detailChips"><span id="dStatus" class="pill"></span><span id="dHost"></span><span id="dResumeChip"></span><span id="dCategory"></span><span id="dQueue"></span></div><div id="dName" class="selectable"></div><div id="dFile" class="mono ell"></div></div>
+              <div class="banner-percent"><strong id="dPercent"></strong><span id="dEta"></span></div>
+              <div class="banner-actions"><button id="dToggle"></button><button id="dFolder">Open folder</button><button id="dCopy">Copy link</button><button id="dMore" aria-label="More download actions" aria-haspopup="menu">&#8943;</button></div>
+            </div>
+          </header>
+          <div id="detailBody">
+            <div class="row detail-progress"><span id="dProgressTop"></span><span class="grow"></span><span id="dPiecesCount"></span></div>
+            <canvas id="connectionBar" height="10" aria-label="Connection progress"></canvas>
+            <div id="detailStats"></div>
+            <div id="detailInfo" class="kv"><span>Saving to</span><span id="dPath" class="mono selectable"></span><span id="dLinkLabel">Link</span><span id="dLink" class="mono selectable"></span><span id="dRuleLabel">Checksum</span><span id="dRule" class="selectable"></span></div>
+            <div id="tabs" role="tablist" aria-label="Download details">
+              <button class="tab active" data-tab="general" data-http>Connections</button><button class="tab" data-tab="peers" data-torrent>Peers</button><button class="tab" data-tab="trackers" data-torrent>Trackers</button><button class="tab" data-tab="content" data-torrent>Files</button><button class="tab" data-tab="pieces" data-torrent>Pieces</button><button class="tab" data-tab="options">Options</button><button class="tab" data-tab="mirrors" data-http>Mirrors</button><button class="tab" data-tab="log">Log</button>
+            </div>
+            <div id="detailLower"><div id="detailPages">
+              <div class="tabpage" id="tab-general"><div id="genLeft"><table class="mini" id="connectionTable"></table></div><div id="splitGen" hidden></div></div>
+              <div class="tabpage" id="tab-options" hidden><input id="dUrl" class="mono" type="text" readonly aria-label="Source link">              <div class="kv">
+
                 <span>Progress</span><span id="dProgress"></span>
                 <span>Resumable</span><span id="dResumable"></span>
-                <span>Status</span><span id="dStatus" class="selectable"></span>
+
                 <span data-http>Connections</span>
                 <span data-http class="row"><input id="dConn" type="range" min="1" max="64" class="grow" title="Changes apply live — more connections split the remaining work"><b id="dConnVal"></b></span>
-                <span>Speed limit</span>
-                <span class="row"><span id="dLimitBox" class="speedbox" title="Pick a preset or type your own: 750k, 2 MB/s… (plain numbers are KB/s, 0 = unlimited). Applies immediately."><input id="dLimit" type="text"><button title="Presets">▾</button></span><span class="hint">for this download only</span></span>
+                <span>Download</span>
+                <span class="row"><span id="dLimitBox" class="speedbox" title="Pick a preset or type your own: 750k, 2 MB/s… (plain numbers are KB/s, 0 = unlimited). Applies immediately."><input id="dLimit" type="text"><button title="Presets" aria-label="Choose speed limit"></button></span><span class="hint">for this download only</span></span>
+                <span data-torrent-only>Upload while downloading</span>
+                <span data-torrent-only class="row"><span id="dUploadBox" class="speedbox"><input type="text" aria-label="Upload limit while downloading"><button title="Presets" aria-label="Choose upload limit"></button></span><span class="hint">for this download only</span></span>
+                <span data-torrent-only>Seeding (after it finishes)</span>
+                <span data-torrent-only class="row"><span id="dSeedingBox" class="speedbox"><input type="text" aria-label="Seeding limit after it finishes"><button title="Presets" aria-label="Choose seeding limit"></button></span><span class="hint">for this download only</span></span>
                 <span data-unfinished>When it's done</span>
                 <label data-unfinished class="check"><input type="checkbox" id="dOpenDone"><span>Open it</span></label>
                 <span data-http>Backup links</span>
@@ -96,37 +110,33 @@
               </div>
               <div class="row wrap" style="margin-top:12px">
                 <button id="dOpen">Open</button>
-                <button id="dFolder">Show in folder</button>
+
                 <button id="dRefresh" data-http title="Swap in a fresh link for an expired one and keep the downloaded bytes">Refresh link…</button>
-                <button id="dCopy">Copy URL</button>
+
               </div>
-            </div>
-            <div class="split-v thin" id="splitGen"></div>
-            <div id="genRight">
-              <div class="row"><span class="muted">File map</span><span class="grow"></span><span id="segInfo" class="hint"></span></div>
-              <canvas id="segBar" height="26"></canvas>
-              <div class="hint" id="segHint">Blue = downloaded, green = a live connection writing. Finished connections steal work from slow ones.</div>
-              <div class="muted" style="margin-top:14px">Speed — last 60 seconds</div>
-              <canvas id="graph" height="112"></canvas>
-            </div>
+</div>
+              <div class="tabpage" id="tab-mirrors" hidden><div id="mirrorList" class="selectable"></div><button id="mirrorAdd">Add mirror&#8230;</button></div>
+              <div class="tabpage" id="tab-log" hidden><pre id="detailLog" class="selectable"></pre></div>
+              <div class="tabpage" id="tab-trackers" hidden><table class="mini" id="trackerTable"></table></div>
+              <div class="tabpage" id="tab-peers" hidden><div id="peerSummary" class="hint"></div><table class="mini" id="peerTable"></table><details><summary>Connection details</summary><table class="mini" id="peerFullTable"></table></details></div>
+              <div class="tabpage" id="tab-content" hidden><table class="mini" id="fileTable"></table></div>
+              <div class="tabpage" id="tab-pieces" hidden><div id="piecesSummary" class="hint"></div><canvas id="pieceMap" height="160" aria-label="Verified torrent pieces"></canvas></div>
+            </div><div id="genRight"><div class="graph-label"><span>Speed, last 60 seconds</span><span class="down">&#9473; download</span><span class="up" data-torrent>&#9473; upload</span></div><canvas id="graph" height="96"></canvas><div class="row"><span class="muted">File map</span><span class="grow"></span><span id="segInfo" class="hint"></span></div><canvas id="segBar" height="20"></canvas><div class="hint" id="segHint"></div></div></div>
           </div>
-          <div class="tabpage" id="tab-trackers" hidden><table class="mini" id="trackerTable"></table></div>
-          <div class="tabpage" id="tab-peers" hidden><div id="peerSummary" class="hint"></div><table class="mini" id="peerTable"></table></div>
-          <div class="tabpage" id="tab-content" hidden><table class="mini" id="fileTable"></table></div>
         </div>
       </div>
     </section>
   </div>
 
   <footer id="status">
-    <span id="statusLeft" class="ell grow"></span>
+    <span id="statusDown" class="mono down"></span><span id="statusUp" class="mono up"></span><span id="statusLeft" class="ell grow"></span>
     <span id="statusTorrent" class="muted" title="BitTorrent engine — DHT lets FluxDM find peers for magnet links without a tracker"></span>
-    <span class="muted" id="limitLabel" title="Global speed limit">Speed limit</span>
+    <span id="statusCounts" class="muted"></span><span id="statusQueues" class="muted"></span><span id="statusFree" class="muted"></span><div class="row status-limit"><span class="muted" id="limitLabel" title="Global download limit">Download limit</span>
     <div id="limitBox" class="speedbox" title="Pick a preset or type your own: 750, 750k, 2 MB/s, 2.5m… (plain numbers are KB/s, 0 = unlimited)">
-      <input id="limitInput" type="text" spellcheck="false">
-      <button id="limitDrop" title="Presets">▾</button>
-    </div>
-  </footer>
+      <input id="limitInput" aria-label="Global download limit" type="text" spellcheck="false">
+      <button id="limitDrop" title="Presets" aria-label="Choose speed limit"></button>
+    </div></div>
+<div class="row status-limit"><span class="muted" id="uploadLabel">Upload limit</span><div id="uploadBox" class="speedbox" title="Sets both torrent upload and seeding limits; separate phase limits remain available in Settings"><input type="text" aria-label="Global torrent upload limit"><button title="Presets" aria-label="Choose upload limit"></button></div></div></footer>
 </div>
 <div id="dropHint" hidden><div>Drop links, a .txt of links or .torrent files</div></div>
 <script src="guard.js"></script>

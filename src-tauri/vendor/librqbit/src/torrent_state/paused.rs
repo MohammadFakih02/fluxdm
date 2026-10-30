@@ -17,6 +17,9 @@ pub struct TorrentStatePaused {
 
 impl TorrentStatePaused {
     pub(crate) fn update_only_files(&mut self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
+        // FluxDM patch: migrate before exposing the new piece selection.
+        self.files
+            .set_file_selection(Some(&only_files.iter().copied().collect::<Vec<_>>()))?;
         self.chunk_tracker
             .update_only_files(&self.metadata.file_infos, only_files)?;
         Ok(())

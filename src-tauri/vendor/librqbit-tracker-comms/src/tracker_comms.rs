@@ -109,6 +109,8 @@ pub struct TrackerComms {
     key: u32,
     // FluxDM patch: seeds, leeches, peers, interval of the last UDP answer.
     last_udp: parking_lot::Mutex<(u64, u64, usize, Duration)>,
+    // FluxDM patch: each tracker subscribes independently.
+    force_announce: tokio::sync::watch::Receiver<u64>,
 }
 
 #[derive(Default)]
@@ -222,6 +224,7 @@ impl TrackerComms {
         announce_port: u16,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
+        force_announce: tokio::sync::watch::Receiver<u64>,
     ) -> Option<BoxStream<'static, SocketAddr>> {
         let trackers = trackers
             .into_iter()
@@ -256,6 +259,7 @@ impl TrackerComms {
                 reqwest_client,
                 key: rand::random(),
                 last_udp: Default::default(),
+                force_announce,
             });
             let mut futures = FuturesUnordered::new();
             for tracker in trackers {
@@ -312,13 +316,15 @@ impl TrackerComms {
 
     async fn task_single_tracker_monitor_http(&self, tracker_url: Url) -> anyhow::Result<()> {
         trace!(url=%tracker_url, "starting monitor");
+        let mut wake = self.force_announce.clone();
         let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
         let hash = self.info_hash.as_string();
         let url_s = tracker_url.to_string();
 
         loop {
+            wake.borrow_and_update();
             status::update(&hash, &url_s, |s| s.state = status::State::Updating);
-            let interval = (|| self.tracker_one_request_http(&tracker_url, event))
+            let request = (|| self.tracker_one_request_http(&tracker_url, event))
                 .retry(
                     ExponentialBuilder::new()
                         .without_max_times()
@@ -330,14 +336,21 @@ impl TrackerComms {
                 .notify(|err, retry_in| {
                     debug!(?retry_in, "error calling tracker: {err:#}");
                     status::err(&hash, &url_s, tracker_message(err), Some(retry_in));
-                })
-                .await
-                .context("this shouldn't fail")?;
+                });
+            // FluxDM patch: a manual request also interrupts retry backoff.
+            tokio::pin!(request);
+            let interval = tokio::select! {
+                result = &mut request => result.context("this shouldn't fail")?,
+                _ = wake.changed() => continue,
+            };
 
             event = None;
             let interval = self.force_tracker_interval.unwrap_or(interval);
             debug!("sleeping for {:?} after calling tracker", interval);
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {},
+                _ = wake.changed() => {},
+            }
         }
     }
 
@@ -420,6 +433,7 @@ impl TrackerComms {
             url.port().context("missing port")?,
         );
 
+        let mut wake = self.force_announce.clone();
         let mut sleep_interval: Option<Duration> = None;
         let mut prev_addrs: Option<UdpTrackerResolveResult> = None;
         let hash = self.info_hash.as_string();
@@ -427,29 +441,39 @@ impl TrackerComms {
         loop {
             if let Some(i) = sleep_interval {
                 trace!(interval=?sleep_interval, "sleeping");
-                tokio::time::sleep(i).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(i) => {},
+                    _ = wake.changed() => {},
+                }
             }
+            wake.borrow_and_update();
             status::update(&hash, &url_s, |s| s.state = status::State::Updating);
 
             // This should retry forever until the addrs are resolved.
-            let addrs = (async || {
-                udp_tracker_to_socket_addrs(host.clone(), port)
-                    .instrument(trace_span!("resolve", ?host))
-                    .await
-                    .or_else(|err| prev_addrs.ok_or(err))
-            })
-            .retry(
-                ExponentialBuilder::new()
-                    .without_max_times()
-                    .with_max_delay(Duration::from_secs(60))
-                    .with_jitter(),
-            )
-            .notify(|err, retry| {
-                debug!(retry_in=?retry, "error resolving tracker: {err:#}");
-                status::err(&hash, &url_s, "Can't resolve the tracker's address".into(), Some(retry));
-            })
-            .await
-            .context("this shouldn't happen: failed resolving tracker addrs")?;
+            let addrs = {
+                let resolve = (async || {
+                    udp_tracker_to_socket_addrs(host.clone(), port)
+                        .instrument(trace_span!("resolve", ?host))
+                        .await
+                        .or_else(|err| prev_addrs.ok_or(err))
+                })
+                .retry(
+                    ExponentialBuilder::new()
+                        .without_max_times()
+                        .with_max_delay(Duration::from_secs(60))
+                        .with_jitter(),
+                )
+                .notify(|err, retry| {
+                    debug!(retry_in=?retry, "error resolving tracker: {err:#}");
+                    status::err(&hash, &url_s, "Can't resolve the tracker's address".into(), Some(retry));
+                });
+                // FluxDM patch: manual requests bypass address-resolution retry backoff too.
+                tokio::pin!(resolve);
+                tokio::select! {
+                    result = &mut resolve => result.context("failed resolving tracker addrs")?,
+                    _ = wake.changed() => { sleep_interval = None; continue; },
+                }
+            };
 
             prev_addrs = Some(addrs);
 
