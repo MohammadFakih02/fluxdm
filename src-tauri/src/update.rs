@@ -1,7 +1,8 @@
-//! Updates FluxDM in place from GitHub Releases: the release must carry FluxDM.exe and FluxDM.exe.sha256.
-//! The new exe is downloaded next to the running one and checked against its SHA-256; then the running exe
-//! is renamed aside (Windows allows that), the new one takes its name, and it's started. The old copy is
-//! deleted on the next start.
+//! Updates FluxDM from GitHub Releases. Releases carry the setup (FluxDM-Setup-<version>.exe) and its .sha256:
+//! it's downloaded, checked against its SHA-256 and run quietly, then the installed FluxDM is started again.
+//! Older releases only had the portable FluxDM.exe (+ .sha256): that is swapped in place instead - the running
+//! exe is renamed aside (Windows allows that), the new one takes its name, and the old copy is deleted on the
+//! next start.
 
 use crate::net;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,9 @@ pub struct Release {
     pub exe_url: String,
     pub sha_url: String,
     pub size: u64,
+    /// The download is the setup (run quietly) rather than the portable exe (swapped in place).
+    #[serde(default)]
+    pub setup: bool,
 }
 
 pub fn current_version() -> &'static str {
@@ -66,14 +70,24 @@ pub async fn check(repo: &str) -> Result<Option<Release>, String> {
     }
     let assets = v["assets"].as_array().cloned().unwrap_or_default();
     let find = |name: &str| assets.iter().find(|a| a["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name))).cloned();
-    let exe = find("FluxDM.exe").ok_or("The latest release has no FluxDM.exe")?;
-    let sha = find("FluxDM.exe.sha256").ok_or("The latest release has no FluxDM.exe.sha256 checksum")?;
+    // The setup first; the portable exe only for releases from before setups carried a checksum.
+    let setup = assets.iter().find(|a| a["name"].as_str().is_some_and(|n| { let n = n.to_ascii_lowercase(); n.starts_with("fluxdm-setup-") && n.ends_with(".exe") })).cloned();
+    let setup_sha = setup.as_ref().and_then(|s| find(&format!("{}.sha256", s["name"].as_str().unwrap_or(""))));
+    let (exe, sha, is_setup) = match (setup, setup_sha) {
+        (Some(s), Some(h)) => (s, h, true),
+        _ => (
+            find("FluxDM.exe").ok_or("The latest release has no setup with a checksum")?,
+            find("FluxDM.exe.sha256").ok_or("The latest release has no checksum")?,
+            false,
+        ),
+    };
     Ok(Some(Release {
         version: tag.trim_start_matches(['v', 'V']).to_string(),
         notes: v["body"].as_str().unwrap_or("").chars().take(2000).collect(),
         exe_url: exe["browser_download_url"].as_str().unwrap_or("").into(),
         sha_url: sha["browser_download_url"].as_str().unwrap_or("").into(),
         size: exe["size"].as_u64().unwrap_or(0),
+        setup: is_setup,
     }))
 }
 
@@ -115,6 +129,12 @@ pub async fn install(rel: &Release, progress: impl Fn(f64)) -> Result<PathBuf, S
     if actual != expected {
         return Err("The downloaded update didn't match its checksum — not installed.".into());
     }
+    if rel.setup {
+        // The setup goes to the temp folder; the caller runs it quietly and starts the installed FluxDM.
+        let setup = std::env::temp_dir().join(format!("FluxDM-Setup-{}.exe", rel.version));
+        std::fs::write(&setup, &buf).map_err(|e| format!("Couldn't save the update ({e})"))?;
+        return Ok(setup);
+    }
     std::fs::write(&new, &buf).map_err(|e| format!("Can't write next to FluxDM.exe ({e}). Is it installed in a protected folder?"))?;
     let _ = std::fs::remove_file(&old);
     std::fs::rename(&exe, &old).map_err(|e| format!("Couldn't move the running exe aside: {e}"))?;
@@ -123,6 +143,11 @@ pub async fn install(rel: &Release, progress: impl Fn(f64)) -> Result<PathBuf, S
         return Err(format!("Couldn't put the new exe in place: {e}"));
     }
     Ok(exe)
+}
+
+/// Where the setup installs FluxDM for this user (the per-user installer's folder).
+pub fn installed_exe() -> PathBuf {
+    std::env::var("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir()).join("FluxDM").join("FluxDM.exe")
 }
 
 /// Deletes the copy left behind by the last update.
@@ -152,5 +177,11 @@ mod tests {
         assert!(super::is_newer("2.0.10", "2.0.9"));
         assert!(!super::is_newer("v2.0.0", "2.0.0"));
         assert!(!super::is_newer("1.9", "2.0.0"));
+    }
+
+    #[test]
+    fn older_saved_releases_still_read_as_portable_updates() {
+        let r: super::Release = serde_json::from_str(r#"{"version":"3.0.1","notes":"","exe_url":"u","sha_url":"s","size":1}"#).unwrap();
+        assert!(!r.setup);
     }
 }

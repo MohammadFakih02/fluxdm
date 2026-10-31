@@ -48,7 +48,7 @@ files (`%APPDATA%\FluxDM`: downloads.json, settings.json, queues.json, stats.jso
 
 ## Status (2026-10-07)
 
-- Version 3.0.1. It takes over the .NET FluxDM 1.0's data as-is; uninstalling 1.0 keeps `%APPDATA%\FluxDM`.
+- Version 3.0.2. It takes over the .NET FluxDM 1.0's data as-is; uninstalling 1.0 keeps `%APPDATA%\FluxDM`.
 - `cargo test`: 12 passed (at 2.0.1; the later changes were only compiled, not run live). Feature-by-feature results are in `FEATURE_PARITY.md`.
 - The torrent engine is a patched librqbit 9.0.1 in `src-tauri/vendor/`. It adds tracker status, peer piece
   counts, file priorities, read-only finished files, BEP 55 holepunch, PEX with flags, availability, peer turnover and sequential download. See `vendor/PATCHES.md`.
@@ -234,3 +234,6 @@ files (`%APPDATA%\FluxDM`: downloads.json, settings.json, queues.json, stats.jso
 
 ### 3.0.1 (2026-10-31)
 - Look picker (`LOOKS`/`chooseLook` in main.js; `LookChosen` and `KeepWindowLook` are kept in Settings `extra`), title-bar drag filler (`.tb-drag`), one-time icon-cache refresh per version (`refresh_icon_cache_after_update`, `LastRunVersion` in `extra`), Microsoft Store hero banners ranked last among store art (art revision 16).
+
+### 3.0.2 (2026-10-31)
+- Updater prefers `FluxDM-Setup-<v>.exe` + `.sha256` (`Release.setup`), runs it with `/S` via cmd after FluxDM exits, then starts `%LOCALAPPDATA%\FluxDM\FluxDM.exe --updated=<pid>`; falls back to the portable exe for old releases. The release workflow writes the setup checksum and keeps the portable exe only for 3.0.2. Settings → Updates has Install + progress.

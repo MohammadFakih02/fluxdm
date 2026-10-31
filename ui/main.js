@@ -83,7 +83,12 @@ async function showFileConflict(p) {
   await listen("torrent-duplicate", (p) => selectOnly(p.id));
   await listen("offer-firewall", offerFirewall);
   await listen("update-available", (rel) => { S.update = rel; $("#updateBadge").hidden = false; $("#btnUpdate").textContent = `Update to ${rel.version}`; });
-  await listen("update-progress", (p) => { const b = $("#updProg"); if (b) b.style.width = p + "%"; });
+  await listen("update-progress", (p) => {
+    const b = $("#updProg"); if (b) b.style.width = p + "%";
+    // Settings → Updates shows the same progress.
+    document.querySelectorAll(".upd-prog").forEach((i) => { i.style.width = p + "%"; });
+    document.querySelectorAll(".upd-text").forEach((s) => { s.textContent = p >= 100 ? "Installing… FluxDM restarts by itself." : `Downloading the update… ${Math.round(p)}%`; });
+  });
   showLimit();
   await invoke("ready");
   setTimeout(async () => { await chooseLook(false); askStartWithWindows(); }, 1500);
@@ -1362,14 +1367,27 @@ async function openSettings() {
   const pair = el("button", { text: "Pair phone (QR code)…", onclick: async () => { try { await invoke("pair_phone"); } catch (e) { alertBox("Pair phone", String(e)); } } });
 
   const updStatus = el("span", { class: "hint grow" });
+  // Updating happens right here: check, then install with progress; FluxDM restarts by itself afterwards.
+  const updBar = el("div", { class: "bar", hidden: true, style: { marginTop: "8px" } }, el("i", { class: "upd-prog" }));
+  const updInstall = el("button", { class: "primary", hidden: true, text: "Install update", onclick: async () => {
+    if (!S.update) return;
+    updInstall.disabled = updBtn.disabled = true;
+    updBar.hidden = false;
+    updStatus.classList.add("upd-text");
+    updStatus.textContent = "Downloading the update… 0%";
+    try { await invoke("install_update", { release: S.update }); }
+    catch (e) { updStatus.classList.remove("upd-text"); updStatus.textContent = String(e); updInstall.disabled = updBtn.disabled = false; updBar.hidden = true; }
+  } });
+  const offer = (rel) => { updStatus.textContent = `Version ${rel.version} is available.`; updInstall.hidden = false; updInstall.textContent = `Install ${rel.version}`; };
   const updBtn = el("button", { text: "Check now", onclick: async () => {
     updStatus.textContent = "Checking…";
     try {
       const rel = await invoke("check_update", { repo: f.UpdateRepo.value.trim() });
-      if (rel) { S.update = rel; $("#updateBadge").hidden = false; $("#btnUpdate").textContent = `Update to ${rel.version}`; updStatus.textContent = `Version ${rel.version} is available.`; }
-      else updStatus.textContent = "You have the latest version.";
+      if (rel) { S.update = rel; $("#updateBadge").hidden = false; $("#btnUpdate").textContent = `Update to ${rel.version}`; offer(rel); }
+      else { updStatus.textContent = "You have the latest version."; updInstall.hidden = true; }
     } catch (e) { updStatus.textContent = String(e); }
   } });
+  if (typeof S !== "undefined" && S.update) offer(S.update);
 
   const appearanceKeys = ["BackgroundColor", "AccentColor", "AccentFromArt", "Glass", "LineGlow", "ArtBehindWindow", "LookupCoversOnline", "ArtSelectedOnly", "ShowIcons", "IconTheme", "KeepWindowLook", "ArtStrength", "ArtBlur", "CardArtStrength", "CardArtBlur", "BannerStrength", "BannerBlur"];
   const numericKeys = ["LineGlow", "ArtStrength", "ArtBlur", "CardArtStrength", "CardArtBlur", "BannerStrength", "BannerBlur"];
@@ -1556,7 +1574,8 @@ async function openSettings() {
 
     section("Updates"),
     field("Automatic check", chk("AutoCheckUpdates", "Check for a new version when FluxDM starts")),
-    el("div", { class: "row" }, updStatus, updBtn),
+    el("div", { class: "row" }, updStatus, updBtn, updInstall),
+    updBar,
     section("Advanced"),
     field("User-Agent", text("UserAgent", { class: "mono grow" })),
     field("Update source (GitHub owner/repo)", text("UpdateRepo", { class: "mono grow", placeholder: "owner/FluxDM" })),
@@ -2049,7 +2068,7 @@ async function showUpdate() {
   const prog = el("div", { class: "bar", style: { marginTop: "10px" } }, el("i", { id: "updProg" }));
   modal({
     title: `FluxDM ${rel.version} is available`,
-    body: el("div", {}, el("p", { text: `You have ${(await invoke("init")).version}. The update downloads ${rel.size ? fmtSize(rel.size) : "the new FluxDM.exe"}, checks its SHA-256 and restarts FluxDM. Running downloads pause and continue after.` }),
+    body: el("div", {}, el("p", { text: `You have ${(await invoke("init")).version}. The update downloads ${rel.size ? fmtSize(rel.size) : "the new version"}, checks its SHA-256, installs it and restarts FluxDM. Running downloads pause and continue after.` }),
       rel.notes ? releaseNotes(rel.notes) : null, prog),
     buttons: [{ label: "Later" }, {
       label: "Update now", primary: true,

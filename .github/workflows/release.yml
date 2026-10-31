@@ -1,6 +1,7 @@
 # Push a tag like v2.0.1 → builds on Windows and publishes a GitHub release with
-# FluxDM-Setup-<version>.exe, FluxDM.exe and FluxDM.exe.sha256 (what FluxDM's
-# "Check for updates" downloads and verifies). Keep the tag equal to the version in
+# FluxDM-Setup-<version>.exe and its .sha256 (what FluxDM's "Check for updates" downloads,
+# verifies and runs quietly). 3.0.2 also carries the portable FluxDM.exe (+ .sha256) one last
+# time, so copies older than 3.0.2 (which only know the portable exe) can still update. Keep the tag equal to the version in
 # src-tauri/tauri.conf.json and src-tauri/Cargo.toml.
 name: release
 
@@ -34,6 +35,15 @@ jobs:
         shell: pwsh
         run: ./build-setup.ps1
 
+      # Setup checksum for the updater; the portable exe only in the 3.0.2 transition release.
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          $setup = "dist/FluxDM-Setup-$v.exe"
+          "$((Get-FileHash $setup -Algorithm SHA256).Hash.ToLower())  FluxDM-Setup-$v.exe" | Set-Content -NoNewline "$setup.sha256"
+          if ($v -ne "3.0.2") { Remove-Item dist/FluxDM.exe, dist/FluxDM.exe.sha256 -ErrorAction SilentlyContinue }
+
       # The release notes are this version's section of CHANGELOG.md ("## 2.2.0 — date" up to the next "## ").
       - name: Release notes from CHANGELOG.md
         shell: pwsh
@@ -45,7 +55,7 @@ jobs:
             if ($on) { $out += $l }
           }
           if (-not $out) { $out = @("See CHANGELOG.md.") }
-          $out += "", "**Download:** ``FluxDM-Setup-$v.exe`` (installer) or ``FluxDM.exe`` (portable). Not code-signed: if SmartScreen warns, click More info, then Run anyway."
+          $out += "", "**Download:** ``FluxDM-Setup-$v.exe``. Not code-signed: if SmartScreen warns, click More info, then Run anyway."
           Set-Content notes.md ($out -join "`n").Trim()
 
       - name: Publish release
@@ -53,7 +63,9 @@ jobs:
         with:
           name: FluxDM ${{ github.ref_name }}
           body_path: notes.md
+          fail_on_unmatched_files: false
           files: |
             dist/FluxDM-Setup-*.exe
+            dist/FluxDM-Setup-*.exe.sha256
             dist/FluxDM.exe
             dist/FluxDM.exe.sha256

@@ -2031,7 +2031,18 @@ async fn install_update(app: AppHandle, release: update::Release) -> R<()> {
     let _ = tokio::time::timeout(Duration::from_secs(15), mgr.pause_all()).await;
     mgr.save();
     // The new copy waits for this process to be gone (see main), or it would hand itself over to us and quit.
-    if let Err(e) = std::process::Command::new(exe).arg(format!("--updated={}", std::process::id())).spawn() {
+    let started = if release.setup {
+        // The setup runs quietly once this window has closed, then the installed FluxDM starts again.
+        use std::os::windows::process::CommandExt as _;
+        let target = update::installed_exe();
+        std::process::Command::new("cmd.exe")
+            .raw_arg(format!("/d /c \"\"{}\" /S & start \"\" \"{}\" --updated={}\"", exe.display(), target.display(), std::process::id()))
+            .creation_flags(win::CREATE_NO_WINDOW)
+            .spawn()
+    } else {
+        std::process::Command::new(exe).arg(format!("--updated={}", std::process::id())).spawn()
+    };
+    if let Err(e) = started {
         let _ = std::fs::remove_file(store::path("update-resume.json"));
         mgr.exiting.store(false, Ordering::SeqCst);
         mgr.resume_after_update(&resume);

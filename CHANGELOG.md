@@ -2,6 +2,11 @@
 
 What changed for people using FluxDM. Developer notes are in `PROJECT_STATE.md`.
 
+## 3.0.2 — 2026-10-31
+
+### Updates
+- Updates install from the setup now: FluxDM downloads it, checks its SHA-256, installs it quietly and restarts. Releases from 3.0.3 on carry only the setup (no portable FluxDM.exe); this release still has it so older copies can update.
+- Settings → Updates installs the update right there, with a progress bar; no need to go back to the main window.
 ## 3.0.1 — 2026-10-31
 
 ### Appearance
