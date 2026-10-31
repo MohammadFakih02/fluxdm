@@ -135,6 +135,27 @@ fn app_icon(app: &AppHandle) -> Option<tauri::image::Image<'static>> {
     Some(tint_icon(base.rgba(), base.width(), base.height(), &s.icon_theme))
 }
 
+/// The first start of a new version: Windows keeps showing the old icon for a pinned taskbar button and for
+/// shortcuts until its icon cache is refreshed, so ask it to refresh once (the same as `ie4uinit -show`).
+fn refresh_icon_cache_after_update(app: &AppHandle) {
+    let version = env!("CARGO_PKG_VERSION");
+    let mgr = app.state::<Arc<Manager>>();
+    {
+        let mut st = mgr.st.lock();
+        if st.settings.extra.get("LastRunVersion").and_then(|v| v.as_str()) == Some(version) { return; }
+        st.settings.extra.insert("LastRunVersion".into(), json!(version));
+    }
+    mgr.mark_dirty();
+    std::thread::spawn(|| {
+        use std::os::windows::process::CommandExt as _;
+        let _ = std::process::Command::new("ie4uinit.exe").arg("-show").creation_flags(win::CREATE_NO_WINDOW).status();
+        unsafe {
+            use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+        }
+    });
+}
+
 /// Puts the chosen icon colour on the tray icon and on every open window (their taskbar buttons follow).
 fn apply_app_icon(app: &AppHandle) {
     let Some(icon) = app_icon(app) else { return };
@@ -2163,6 +2184,7 @@ fn main() {
                 })
                 .build(tapp)?;
             apply_app_icon(&handle);
+            refresh_icon_cache_after_update(&handle);
 
             // Closing the main window keeps FluxDM in the tray (or exits, per settings).
             if let Some(w) = handle.get_webview_window("main") {

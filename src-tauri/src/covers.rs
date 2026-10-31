@@ -393,7 +393,7 @@ pub async fn lookup(mgr: &Arc<Manager>, id: &str, custom: Option<String>) -> Opt
             }
         }
         let found = enrich_art(&it, &title, found).await;
-        let revision = 15;
+        let revision = 16;
         let net_failed = found.is_none() && NET_FAILS.load(Ordering::Relaxed) != fails_before;
         tokio::time::sleep(Duration::from_millis(1500)).await; // stay well within the services' rate limits
         mgr.with_item(id, |it| {
@@ -826,7 +826,7 @@ struct Found {
 fn artwork_due(it: &Item) -> bool {
     (it.icon_source.starts_with("steam:") || it.icon_source.starts_with("web:")
             || it.icon_source == "none" && worth_lookup(it) && it.icon_lookup_at.is_none_or(|t| t <= chrono::Local::now()))
-        && (it.banner_revision < 15 || it.icon_lookup_at.is_none_or(|t| t < chrono::Local::now() - chrono::Duration::days(7)))
+        && (it.banner_revision < 16 || it.icon_lookup_at.is_none_or(|t| t < chrono::Local::now() - chrono::Duration::days(7)))
 }
 
 async fn repair_artwork(mgr: &Arc<Manager>, id: &str) {
@@ -842,7 +842,7 @@ async fn repair_artwork(mgr: &Arc<Manager>, id: &str) {
             existing.banner = web_banner(&existing.source, &stem).await;
         }
         let found = enrich_art(&it, &display_title(&it), Some(existing)).await;
-        let revision = 15;
+        let revision = 16;
         mgr.with_item(id, |x| {
             if x.icon_source != it.icon_source || x.file_name != it.file_name { return; }
             x.banner_revision = revision;
@@ -1076,7 +1076,8 @@ async fn gog_banner(title: &str) -> Option<String> {
 fn banner_rank(path: &str) -> u8 {
     let name = Path::new(path).file_name().unwrap_or_default().to_string_lossy();
     if name.ends_with("-hero-v3.jpg") { 0 }
-    else if name.starts_with("web-ms-") { 1 }
+    // Microsoft Store hero art leaves a wide empty area for the store's own text: only when nothing better exists.
+    else if name.starts_with("web-ms-") { 5 }
     else if name.starts_with("web-ps-") && name.contains("-pic0.") { 2 }
     else if name.starts_with("web-gog-") { 3 }
     else if name.starts_with("steam-") { 4 }
@@ -1848,8 +1849,8 @@ mod tests {
         it.icon_lookup_at = Some(chrono::Local::now());
         assert!(artwork_due(&it));
         it.banner_revision = 9;
-        assert!(artwork_due(&it), "revision 15 re-checks every banner and icon once");
-        it.banner_revision = 15;
+        assert!(artwork_due(&it), "revision 16 re-checks every banner and icon once");
+        it.banner_revision = 16;
         assert!(!artwork_due(&it));
         it.banner_revision = 0;
         it.icon_lookup_at = Some(chrono::Local::now() + chrono::Duration::days(3650));
@@ -1860,7 +1861,7 @@ mod tests {
 
     #[test]
     fn banner_priority_preserves_better_cached_art_during_failures() {
-        let paths = ["steam-42-hero-v3.jpg", "web-ms-42-hero.webp", "web-ps-CUSA00362-pic0.webp", "web-gog-42.jpg", "steam-42-banner-v2.jpg", "web-page-banner.jpg", "web-shot-42.jpg"];
+        let paths = ["steam-42-hero-v3.jpg", "web-ps-CUSA00362-pic0.webp", "web-gog-42.jpg", "steam-42-banner-v2.jpg", "web-ms-42-hero.webp", "web-page-banner.jpg", "web-shot-42.jpg"];
         for (a, candidate) in paths.iter().enumerate() {
             for (b, cached) in paths.iter().enumerate() {
                 assert_eq!(preferred_banner(Some((*candidate).into()), Some((*cached).into())).as_deref(), Some(paths[a.min(b)]));

@@ -518,6 +518,8 @@ tr.r:hover .download-card { background-color: var(--hover); }
 #titlebar .tb-brand img { width:16px; height:16px; }
 #titlebar .tb-center { height:100%; display:flex; align-items:center; justify-content:center; grid-column:2; }
 #titlebar #search { width:100%; max-width:460px; height:30px; }
+/* The empty space between the search box and the window buttons drags the window and double-click maximizes. */
+#titlebar .tb-drag { grid-column:3; grid-row:1; align-self:stretch; min-width:0; }
 #titlebar .decorum-tb-btn { grid-row:1; height:40px !important; width:46px !important; border:0 !important; border-radius:0 !important; background:transparent !important; color:var(--text) !important; font-family:"Segoe Fluent Icons","Segoe MDL2 Assets" !important; font-size:10px !important; display:inline-grid !important; place-items:center; cursor:default; }
 #titlebar .decorum-tb-btn:hover { background:rgba(255,255,255,.08) !important; }
 #titlebar .decorum-tb-btn:active { background:rgba(255,255,255,.05) !important; color:var(--text-2) !important; }
@@ -581,3 +583,10 @@ body:not(:focus-within) #titlebar .tb-brand, body:not(:focus-within) #titlebar .
 #detailBanner #bannerArt.small-banner::after {
   filter: brightness(calc(.8 * var(--banner-strength, 1))) blur(var(--banner-blur, 0px)); transform: scale(calc(1 + var(--banner-blur-scale, 0)));
 }
+
+/* Choose your look */
+.look-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:12px; margin-top:10px; }
+.look-card { display:flex; flex-direction:column; align-items:stretch; gap:4px; height:auto; padding:8px; text-align:left; border-radius:12px; }
+.look-card[aria-pressed="true"] { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent), 0 0 16px color-mix(in srgb,var(--accent) 30%,transparent); }
+.look-card small { color:var(--text-3); font-size:11px; white-space:normal; }
+.look-preview { position:relative; height:110px; border-radius:8px; overflow:hidden; border:1px solid rgba(255,255,255,.08); }

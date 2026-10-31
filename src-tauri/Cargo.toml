@@ -1,6 +1,6 @@
 [package]
 name = "fluxdm"
-version = "3.0.0"
+version = "3.0.1"
 description = "A small, fast download manager for Windows"
 authors = ["Mohammad Fakih"]
 edition = "2021"

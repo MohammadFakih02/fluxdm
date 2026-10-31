@@ -2,6 +2,16 @@
 
 What changed for people using FluxDM. Developer notes are in `PROJECT_STATE.md`.
 
+## 3.0.1 — 2026-10-31
+
+### Appearance
+- "Choose your look" on first start: five complete looks (Full heat, Midnight, Neon, Forest, Mono), each shown as a small preview of the window and applied live while you pick. It can be opened again from Settings → Appearance.
+- New option: keep the same look for every download, so the window's colours and background art no longer change when you select a download.
+
+### Fixed
+- The empty part of the title bar right of the search box now drags the window, and a double-click maximizes it.
+- After an update, Windows refreshes its icon cache once, so a pinned taskbar button or an old shortcut shows the new icon instead of the old one.
+- Banners no longer differ from one PC to another when one store answers slowly: Microsoft Store hero pictures (which leave a wide empty area for store text) are only used when no PlayStation, GOG or Steam picture exists. Banners are re-checked once.
 ## 3.0.0 — 2026-10-31
 
 ### Appearance

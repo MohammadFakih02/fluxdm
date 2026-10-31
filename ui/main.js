@@ -86,7 +86,7 @@ async function showFileConflict(p) {
   await listen("update-progress", (p) => { const b = $("#updProg"); if (b) b.style.width = p + "%"; });
   showLimit();
   await invoke("ready");
-  setTimeout(askStartWithWindows, 4000);
+  setTimeout(async () => { await chooseLook(false); askStartWithWindows(); }, 1500);
   setInterval(() => refreshDetails(true), 1000);
   refreshFreeSpace(); setInterval(refreshFreeSpace, 30000);
 })();
@@ -1371,7 +1371,7 @@ async function openSettings() {
     } catch (e) { updStatus.textContent = String(e); }
   } });
 
-  const appearanceKeys = ["BackgroundColor", "AccentColor", "AccentFromArt", "Glass", "LineGlow", "ArtBehindWindow", "LookupCoversOnline", "ArtSelectedOnly", "ShowIcons", "IconTheme", "ArtStrength", "ArtBlur", "CardArtStrength", "CardArtBlur", "BannerStrength", "BannerBlur"];
+  const appearanceKeys = ["BackgroundColor", "AccentColor", "AccentFromArt", "Glass", "LineGlow", "ArtBehindWindow", "LookupCoversOnline", "ArtSelectedOnly", "ShowIcons", "IconTheme", "KeepWindowLook", "ArtStrength", "ArtBlur", "CardArtStrength", "CardArtBlur", "BannerStrength", "BannerBlur"];
   const numericKeys = ["LineGlow", "ArtStrength", "ArtBlur", "CardArtStrength", "CardArtBlur", "BannerStrength", "BannerBlur"];
   function preview() {
     const appearance = Object.fromEntries(appearanceKeys.filter(k => f[k]).map(k => [k, f[k].type === "checkbox" ? f[k].checked : numericKeys.includes(k) ? +f[k].value : f[k].value]));
@@ -1421,6 +1421,7 @@ async function openSettings() {
     section("Appearance"), hint("How FluxDM looks. Changes show right away."),
     field("Background colour", choices("BackgroundColor", [["navy","Deep navy","#0b1222"],["black","Pure black","#000000"],["graphite","Graphite","#16181c"],["purple","Purple night","#150f22"],["forest","Forest","#0b1a14"]])),
     field("Accent colour", el("div", {}, chk("AccentFromArt", "Take it from the game's art when there is one"), hint("Otherwise"), choices("AccentColor", [["#e9c98f","Warm cream"],["#f5a524","Amber"],["#4cc2ff","Cyan"],["#a78bfa","Violet"],["#5eead4","Mint"]], true))),
+    field("Look", el("button", { type: "button", text: "Choose a look…", onclick: () => chooseLook(true) }), chk("KeepWindowLook", "Keep the same look for every download (colours and background art don't change when you select one)")),
     field("App icon", iconThemes()),
     hint("For the tray icon, the taskbar and window icons and the logo in the app. The FluxDM.exe file keeps Full heat in Explorer and the Start menu."),
     field("Glass", choices("Glass", ["Solid","Frosted","Clear","Ghost"].map(label => [label.toLowerCase(),label]))),
@@ -1950,6 +1951,58 @@ function showCountdown(p) {
   publish();
 }
 
+/** Complete looks offered on first start (and from Settings → Appearance). Each sets every appearance option. */
+const LOOKS = [
+  { id: "heat", name: "Full heat", note: "Game art and colours follow the selected download",
+    s: { BackgroundColor: "navy", AccentColor: "#e9c98f", AccentFromArt: true, ArtBehindWindow: true, KeepWindowLook: false, Glass: "ghost", IconTheme: "heat", ArtStrength: 100, CardArtStrength: 100, BannerStrength: 100 } },
+  { id: "midnight", name: "Midnight", note: "Calm and fixed: one colour, no art behind the window",
+    s: { BackgroundColor: "black", AccentColor: "#4cc2ff", AccentFromArt: false, ArtBehindWindow: false, KeepWindowLook: true, Glass: "frosted", IconTheme: "ice", ArtStrength: 100, CardArtStrength: 100, BannerStrength: 90 } },
+  { id: "neon", name: "Neon", note: "Vivid art, see-through glass",
+    s: { BackgroundColor: "purple", AccentColor: "#a78bfa", AccentFromArt: true, ArtBehindWindow: true, KeepWindowLook: false, Glass: "clear", IconTheme: "neon", ArtStrength: 250, CardArtStrength: 175, BannerStrength: 110 } },
+  { id: "forest", name: "Forest", note: "Soft green, fixed colours, faint art",
+    s: { BackgroundColor: "forest", AccentColor: "#5eead4", AccentFromArt: false, ArtBehindWindow: true, KeepWindowLook: true, Glass: "frosted", IconTheme: "emerald", ArtStrength: 75, CardArtStrength: 100, BannerStrength: 100 } },
+  { id: "mono", name: "Mono", note: "Graphite and silver, no colour from art",
+    s: { BackgroundColor: "graphite", AccentColor: "#d0d4dc", AccentFromArt: false, ArtBehindWindow: false, KeepWindowLook: true, Glass: "solid", IconTheme: "mono", ArtStrength: 100, CardArtStrength: 75, BannerStrength: 80 } },
+];
+const LOOK_BG = { navy: "#0b1222", black: "#000000", graphite: "#16181c", purple: "#150f22", forest: "#0b1a14" };
+
+/** A small drawing of the window in a look: title bar, rail, list rows with progress, details banner. */
+function lookPreview(look) {
+  const s = look.s, bg = LOOK_BG[s.BackgroundColor], a = s.AccentColor;
+  const art = s.ArtBehindWindow ? "linear-gradient(120deg, #3a2a55 0%, #8a4b2a 45%, #1b3a4a 100%)" : "none";
+  const glass = { solid: .92, frosted: .7, clear: .45, ghost: .3 }[s.Glass] ?? .5;
+  const panel = `rgba(14,16,22,${glass})`;
+  const row = (w, on) => `<div style="height:13px;border-radius:3px;margin:4px 0;background:${on ? "rgba(255,255,255,.09)" : "rgba(255,255,255,.04)"};${on ? `box-shadow:inset 0 0 0 1px ${a}` : ""}"><i style="display:block;height:2px;margin-top:10px;width:${w}%;background:${a}"></i></div>`;
+  return el("div", { class: "look-preview", html: `
+    <div style="position:absolute;inset:0;background:${bg}"></div>
+    <div style="position:absolute;inset:0;background:${art};opacity:${s.ArtBehindWindow ? .35 * Math.min(2, (s.ArtStrength || 100) / 100) : 0};filter:blur(6px)"></div>
+    <div style="position:absolute;left:0;right:0;top:0;height:12px;background:rgba(0,0,0,.35)"></div>
+    <div style="position:absolute;left:4px;top:16px;bottom:4px;width:16px;border-radius:4px;background:${panel}"><i style="display:block;margin:4px 3px;height:8px;border-radius:2px;background:${a}"></i></div>
+    <div style="position:absolute;left:24px;top:16px;bottom:4px;width:42%;padding:2px 4px;border-radius:4px;background:${panel}">${row(80, false)}${row(45, true)}${row(100, false)}${row(20, false)}</div>
+    <div style="position:absolute;right:4px;top:16px;bottom:4px;left:calc(42% + 30px);border-radius:4px;background:${panel};overflow:hidden">
+      <div style="height:45%;background:${s.ArtBehindWindow || !s.KeepWindowLook ? "linear-gradient(120deg,#5b3d7a,#c0703a 55%,#284e63)" : "linear-gradient(120deg,#2a2f3a,#3a404c)"};filter:brightness(${(s.BannerStrength || 100) / 120})"></div>
+      <i style="display:block;margin:6px;height:3px;width:60%;background:${a}"></i><i style="display:block;margin:6px;height:3px;width:35%;background:rgba(255,255,255,.25)"></i></div>` });
+}
+
+/** "Choose your look": asked once on first start; `force` opens it from Settings. Resolves when closed. */
+async function chooseLook(force) {
+  const g = await invoke("get_settings").catch(() => null);
+  if (!g || (!force && g.settings.LookChosen)) return;
+  let pick = LOOKS.find((l) => l.s.IconTheme === (g.settings.IconTheme || "heat") && l.s.BackgroundColor === g.settings.BackgroundColor) || LOOKS[0];
+  const cards = LOOKS.map((look) => {
+    const b = el("button", { type: "button", class: "look-card", "aria-pressed": String(look === pick), onclick: () => { pick = look; for (const c of cards) c.setAttribute("aria-pressed", String(c === b)); applyAppearance({ ...g.settings, ...look.s }); } },
+      lookPreview(look), el("b", { text: look.name }), el("small", { text: look.note }));
+    return b;
+  });
+  const chosen = await new Promise((res) => modal({ title: "Choose your look", xwide: true,
+    body: el("div", {}, el("p", { class: "hint", text: "Pick how FluxDM looks. Clicking a look shows it on the window right away. Everything can be fine-tuned later in Settings → Appearance." }), el("div", { class: "look-grid" }, ...cards)),
+    buttons: [{ label: force ? "Cancel" : "Keep the current look", value: null }, { label: "Use this look", primary: true, value: "use" }], onClose: res }));
+  const next = { ...g.settings, ...(chosen === "use" ? pick.s : {}), LookChosen: true };
+  try { await invoke("save_settings", { settings: next }); S.settings = { ...S.settings, ...next }; } catch {}
+  applyAppearance(S.settings || next);
+  artKey = ""; updateWindowArt();
+  if (typeof rebuildAllRows === "function") rebuildAllRows();
+}
 // Every two weeks while "Start with Windows" is off; it counts as asked only once answered (a tray-only start shows it when opened).
 async function askStartWithWindows() {
   if (!(await invoke("startup_prompt_due").catch(() => false))) return;
@@ -2296,8 +2349,9 @@ const accentCache = new Map();
 const accentDone = new Map();
 function updateWindowArt() {
   const r = S.rows.get(S.cur), st = S.settings || {};
-  const banner = r?.banner || r?.icon || r?.cover || "";
-  const key = JSON.stringify([banner, st.ArtBehindWindow, st.AccentFromArt, st.AccentColor]);
+  // "Keep the same look": the window's colours and background art don't follow the selected download.
+  const banner = st.KeepWindowLook ? "" : r?.banner || r?.icon || r?.cover || "";
+  const key = JSON.stringify([banner, st.ArtBehindWindow, st.AccentFromArt, st.AccentColor, st.KeepWindowLook]);
   if (key === artKey) return;
   artKey = key; const generation = ++artGeneration;
   const root = document.documentElement;
